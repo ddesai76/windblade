@@ -1,0 +1,25 @@
+icao,lat_deg,lon_deg,elev_m,name
+KAXX,36.422,-105.289905,2554,Angel Fire Airport
+KSAF,35.617222,-106.089444,1935,Santa Fe Regional Airport
+KDEN,39.861667,-104.673056,1655.5,Denver International Airport
+KCOS,38.805833,-104.700556,1881,Colorado Springs Airport
+KABQ,35.040194,-106.609194,1619.1,Albuquerque International Sunport
+KLAX,33.942536,-118.408075,38.1,Los Angeles International Airport
+KSFO,37.618972,-122.374889,4,San Francisco International Airport
+KSNA,33.675667,-117.868222,17.1,John Wayne Airport Orange County
+KSJC,37.362375,-121.929022,18,San Jose International Airport
+KSLC,40.788389,-111.977772,1288.1,Salt Lake City International Airport
+KPHX,33.437269,-112.007788,340.5,Phoenix Sky Harbor International Airport
+KSAT,29.533694,-98.469778,242.9,San Antonio International Airport
+KDAL,32.847111,-96.851778,145.4,Dallas Love Field
+KDFW,32.896944,-97.038056,182.3,Dallas Fort Worth International Airport
+KMCO,28.429394,-81.308994,29,Orlando International Airport
+KMIA,25.79565,-80.290556,2.7,Miami International Airport
+KATL,33.636719,-84.428067,313.3,Hartsfield-Jackson Atlanta International
+KJFK,40.639751,-73.778925,3.9,New York John F. Kennedy International
+KLGA,40.777245,-73.872608,6.7,New York LaGuardia Airport
+KEWR,40.692501,-74.168701,9.1,Newark Liberty International Airport
+KBOS,42.364347,-71.005181,9.1,Boston Logan International Airport
+KORD,41.978603,-87.904842,205.1,Chicago O'Hare International Airport
+KMDW,41.786001,-87.752417,188.1,Chicago Midway International Airport
+KSEA,47.449888,-122.311777,131.7,Seattle-Tacoma International Airport
