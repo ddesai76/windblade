@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
-# windblade.py:   eVTOL Tiltrotor Sim Mission Planner and Launcher
+#
+# windblade.py:   Mission Planner and Launcher GUI
 # AUTHOR:         DANIEL DESAI
-# UPDATED:        2026-05-10
-# VERSION:        0.1.0
+# UPDATED:        2026-06-15
+# VERSION:        0.1.1
+
 """
 Single-file entry point.  Run and a browser window opens with the
 mission planner GUI.  Fill in the form, click Launch — the script
@@ -88,6 +90,7 @@ def read_rotor_csv() -> list[dict]:
                     "pitch_offset_deg":  float(row["pitch_offset_deg"].strip()),
                     "P_max_kW":          float(row["P_max_kW"].strip()),
                     "rpm_hover":         float(row["rpm_hover"].strip()),
+                    "powerplant":   row.get("powerplant", "electric").strip(),
                     "notes":             row.get("notes","").strip(),
                 })
             except (KeyError, ValueError):
@@ -135,7 +138,7 @@ _HTML = r"""<!DOCTYPE html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>WINDBLADE</title>
+<title>🚁 WINDBLADE</title>
 <link href="https://fonts.googleapis.com/css2?family=B612+Mono:wght@400;700&family=B612:wght@400;700&display=swap" rel="stylesheet">
 <style>
 *{box-sizing:border-box;margin:0;padding:0}
@@ -151,12 +154,12 @@ html,body{background:var(--bg);color:var(--nw);font-family:var(--mono);font-size
 .shell{display:grid;grid-template-columns:320px 1fr;min-height:100vh}
 .sidebar{background:var(--panel);border-right:1px solid var(--stroke-hi);display:flex;flex-direction:column;position:sticky;top:0;height:100vh;overflow-y:auto}
 .main{display:flex;flex-direction:column}
-.topbar{display:flex;align-items:center;justify-content:space-between;padding:18px 36px;background:var(--hi);border-bottom:1px solid var(--stroke-hi);position:sticky;top:0;z-index:10}
-.topbar-title{font-family:var(--sans);font-size:26px;font-weight:700;letter-spacing:.06em;color:var(--nw)}
+.topbar{display:flex;align-items:center;justify-content:space-between;padding:18px 36px;background:var(--hi);position:sticky;top:0;z-index:10}
+.topbar-title{font-family:var(--sans);font-size:20px;font-weight:700;letter-spacing:.06em;color:var(--dim)}
 .content{flex:1;padding:36px 44px;overflow-y:auto}
 .statusbar{font-size:20px;color:var(--dim);padding:10px 36px;border-top:1px solid var(--stroke);background:var(--panel);position:sticky;bottom:0}
-.sb-logo{padding:24px 22px 18px;font-size:18px;letter-spacing:.12em;color:var(--faint);border-bottom:1px solid var(--stroke)}
-.sb-logo span{color:var(--ga);font-weight:700}
+.sb-logo{padding:20px 22px 16px}
+.sb-logo svg{display:block}
 .sb-sec{font-size:16px;letter-spacing:.14em;color:var(--faint);padding:18px 22px 6px;text-transform:uppercase}
 .nav-item{display:flex;align-items:center;gap:14px;padding:16px 22px;cursor:pointer;font-size:22px;color:var(--dim);border-left:3px solid transparent;transition:all .12s}
 .nav-item:hover{background:var(--hi);color:var(--nw)}
@@ -216,7 +219,14 @@ html,body{background:var(--bg);color:var(--nw);font-family:var(--mono);font-size
 <body>
 <div class="shell">
 <div class="sidebar">
-  <div class="sb-logo">e<span>VTOL</span> / sim</div>
+  <div class="sb-logo">
+    <svg viewBox="0 0 220 44" width="220" height="44" xmlns="http://www.w3.org/2000/svg">
+      <text x="6" y="34"
+        font-family="B612,sans-serif" font-size="28" font-weight="700" font-style="italic"
+        fill="#47a6f2" letter-spacing="2"
+        transform="skewX(-8)">WINDBLADE</text>
+    </svg>
+  </div>
   <div class="sb-sec">Mission</div>
   <div class="nav-item active" onclick="nav('route',this)">
     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M3 12h18M3 6l9-3 9 3M3 18l9 3 9-3"/></svg>Route &amp; weather
@@ -242,7 +252,6 @@ html,body{background:var(--bg);color:var(--nw);font-family:var(--mono);font-size
     <span class="topbar-title">Mission Planner</span>
     <div style="display:flex;gap:8px;align-items:center">
       <span class="badge info" id="rotor-badge">loading rotors...</span>
-      <span class="badge ok" id="ready-badge">ready</span>
     </div>
   </div>
   <div class="content">
@@ -318,18 +327,14 @@ html,body{background:var(--bg);color:var(--nw);font-family:var(--mono);font-size
 
     <!-- Rotor config -->
     <div class="panel" id="panel-rotors">
-      <div class="metric-row">
-        <div class="metric"><div class="val" id="r-count">—</div><div class="lbl">Rotors</div><div class="sub c-ok" id="r-status">loading...</div></div>
-        <div class="metric"><div class="val" id="r-rpm">—</div><div class="lbl">RPM (hover ref)</div><div class="sub c-dim">rotor 1</div></div>
-        <div class="metric"><div class="val" id="r-pmax">—</div><div class="lbl">Motor ceiling</div><div class="sub c-dim">rotor 1</div></div>
-        <div class="metric"><div class="val" id="r-nondefault">—</div><div class="lbl">Non-default</div><div class="sub c-dim" id="r-nondefault-sub">vs S4 baseline</div></div>
-      </div>
       <div class="sec">Fleet — <span id="rotor-csv-path" style="color:var(--faint)"></span></div>
+      <div id="rotor-fleet-error" style="display:none" class="callout" style="border-color:var(--rd);color:var(--rd)"></div>
       <table class="data-table" id="rotor-table">
-        <thead><tr><th>#</th><th>Position</th><th>R (m)</th><th>Blades</th><th>Chord (m)</th><th>Twist root</th><th>P max (kW)</th><th>RPM hover</th><th>Notes</th></tr></thead>
-        <tbody id="rotor-tbody"><tr><td colspan="9" class="c-dim" style="padding:12px 8px">Loading...</td></tr></tbody>
+        <thead><tr><th>#</th><th>Position</th><th>R (m)</th><th>Blades</th><th>Chord (m)</th><th>Twist root</th><th>P max (kW)</th><th>RPM hover</th><th>Propulsion</th><th>Notes</th></tr></thead>
+        <tbody id="rotor-tbody"><tr><td colspan="10" class="c-dim" style="padding:12px 8px">Loading...</td></tr></tbody>
       </table>
       <p class="path-note">Edit <code>subsystems/propulsion/rotor_config.csv</code> and click the Rotor Config tab again to reload.</p>
+      <div id="rotor-disks" style="margin-top:24px"></div>
     </div>
 
     <!-- Launch -->
@@ -421,42 +426,57 @@ function loadRotors(){
     .then(r=>r.json())
     .then(data=>{
       rotorData=data.rotors||[];
-      renderRotorTable(rotorData);
       var n=rotorData.length;
-      document.getElementById('r-count').textContent=n||'—';
-      document.getElementById('r-status').textContent=n?'fleet loaded':'csv not found';
-      document.getElementById('r-status').className='sub '+(n?'c-ok':'c-warn');
-      document.getElementById('rotor-badge').textContent=n+' rotor'+(n!==1?'s':'')+' loaded';
-      document.getElementById('rotor-badge').className='badge ok';
+      var err=data.error||null;
+      // Show/hide fleet error banner
+      var errEl=document.getElementById('rotor-fleet-error');
+      if(err){
+        errEl.textContent=err;
+        errEl.style.display='block';
+        errEl.style.borderColor='var(--rd)';
+        errEl.style.color='var(--rd)';
+      } else {
+        errEl.style.display='none';
+      }
+      renderRotorTable(rotorData);
+      renderRotorDisks(rotorData);
       document.getElementById('rotor-csv-path').textContent=data.path||'';
-      if(n>0){
-        document.getElementById('r-rpm').textContent=rotorData[0].rpm_hover;
-        document.getElementById('r-pmax').textContent=rotorData[0].P_max_kW+' kW';
-        var nd=rotorData.filter(r=>
-          Math.abs(r.R_m-S4.R_m)>0.001||Math.abs(r.P_max_kW-S4.P_max_kW)>0.1||
-          Math.abs(r.rpm_hover-S4.rpm_hover)>1).length;
-        document.getElementById('r-nondefault').textContent=nd;
-        document.getElementById('r-nondefault-sub').textContent=nd?'non-S4 values':'all S4 default';
-        document.getElementById('r-nondefault-sub').className='sub '+(nd?'c-warn':'c-ok');
+      if(err){
+        document.getElementById('rotor-badge').textContent=err;
+        document.getElementById('rotor-badge').className='badge warn';
+      } else if(n===0){
+        document.getElementById('rotor-badge').textContent='csv not found';
+        document.getElementById('rotor-badge').className='badge warn';
+      } else {
+        document.getElementById('rotor-badge').textContent=n+' rotor'+(n!==1?'s':'')+' loaded';
+        document.getElementById('rotor-badge').className='badge ok';
       }
     })
     .catch(()=>{
-      document.getElementById('rotor-badge').textContent='csv error';
+      document.getElementById('rotor-badge').textContent='csv not found';
       document.getElementById('rotor-badge').className='badge warn';
     });
+}
+
+function propCls(t){
+  if(t==='electric')return 'c-ok';
+  if(t==='turboshaft')return 'c-warn';
+  if(t==='turbine-electric')return 'c-dim';
+  return '';
 }
 
 function renderRotorTable(rotors){
   var tbody=document.getElementById('rotor-tbody');
   if(!rotors.length){
-    tbody.innerHTML='<tr><td colspan="9" class="c-warn" style="padding:12px 8px">rotor_config.csv not found or empty</td></tr>';
+    tbody.innerHTML='<tr><td colspan="10" class="c-warn" style="padding:12px 8px">rotor_config.csv not found or empty</td></tr>';
     return;
   }
   tbody.innerHTML=rotors.map((r,i)=>{
-    var pos=POSITIONS[i]||'?';
+    var pos=POSITIONS[i]||'pos-'+i;
     var rc=Math.abs(r.R_m-S4.R_m)>0.001?'c-warn':'';
     var pc=Math.abs(r.P_max_kW-S4.P_max_kW)>0.1?'c-warn':'';
     var rpc=Math.abs(r.rpm_hover-S4.rpm_hover)>1?'c-warn':'';
+    var pt=r.powerplant||'electric';
     return '<tr>'
       +'<td class="c-dim">'+r.rotor_id+'</td>'
       +'<td>'+pos+'</td>'
@@ -466,9 +486,86 @@ function renderRotorTable(rotors){
       +'<td>'+r.twist_root_deg.toFixed(1)+'&deg;</td>'
       +'<td class="'+pc+'">'+r.P_max_kW.toFixed(0)+'</td>'
       +'<td class="'+rpc+'">'+r.rpm_hover.toFixed(0)+'</td>'
+      +'<td class="'+propCls(pt)+'">'+pt+'</td>'
       +'<td class="c-dim">'+r.notes+'</td>'
       +'</tr>';
   }).join('');
+}
+
+// ── Inline rotor disk SVGs (outline style, NVG palette) ──────────────
+// All tiles share the same pixel footprint (tileSize). The SVG coordinate
+// space is anchored to the fleet's largest rotor (R_max), so each disk
+// renders proportionally smaller if its R_m is below the fleet maximum.
+function buildDiskSVG(r, tileSize, R_max){
+  var LABEL_H = 22;    // px reserved at bottom for the R label (outside disk area)
+  var PAD     = 6;     // px margin above and on sides
+  var S = tileSize || 160;
+  var drawH = S - LABEL_H;          // vertical space available for the disk
+  // Disk centre sits in the middle of the draw area, with top/side padding
+  var cx = S / 2;
+  var cy = PAD + (drawH - PAD) / 2;
+  // Maximum disk radius: largest rotor just touches the margins
+  var maxDiskPx = Math.min(S/2 - PAD, (drawH - PAD) / 2) * 0.96;
+  var R_m = r.R_m || 1.45;
+  var R = maxDiskPx * (R_m / R_max);   // proportional disk radius
+  var hubR = R * 0.18;
+  var nb = r.n_blades || 6;
+  var chordRoot = r.chord_m || 0.096;
+  var chordTip = chordRoot * 0.55;
+  var scale = R / R_m;
+  var cRpx = Math.min(chordRoot * scale * 3.5, R * 0.28);
+  var cTpx = Math.min(chordTip  * scale * 3.5, R * 0.16);
+  var pt = r.powerplant || 'electric';
+  var diskColor = pt==='electric' ? '#00e040' : pt==='turboshaft' ? '#e8c000' : '#47a6f2';
+  var strokeW = 1.2;
+
+  var blades = '';
+  for(var b = 0; b < nb; b++){
+    var ang = 2*Math.PI*b/nb - Math.PI/2;
+    var ca = Math.cos(ang), sa = Math.sin(ang);
+    function pt2(r_px, c_px, side){
+      var offset = side===1 ? c_px/4 : -3*c_px/4;
+      return [(cx + r_px*ca - offset*sa), (cy + r_px*sa + offset*ca)];
+    }
+    var p0 = pt2(hubR, cRpx,  1);   // root LE
+    var p1 = pt2(R,    cTpx,  1);   // tip LE
+    var p2 = pt2(R,    cTpx, -1);   // tip TE
+    var p3 = pt2(hubR, cRpx, -1);   // root TE
+    var hw = Math.sqrt((p1[0]-p2[0])**2 + (p1[1]-p2[1])**2) / 2;
+    var d = 'M'+p0[0].toFixed(1)+','+p0[1].toFixed(1)
+          + ' L'+p1[0].toFixed(1)+','+p1[1].toFixed(1)
+          + ' A'+hw.toFixed(1)+','+hw.toFixed(1)+' 0 0,0 '+p2[0].toFixed(1)+','+p2[1].toFixed(1)
+          + ' L'+p3[0].toFixed(1)+','+p3[1].toFixed(1)+' Z';
+    blades += '<path d="'+d+'" fill="none" stroke="'+diskColor+'" stroke-width="'+strokeW+'" stroke-linejoin="round"/>';
+  }
+
+  // Disk outline — dashed circle at actual R (not maxDiskPx)
+  var disk = '<circle cx="'+cx+'" cy="'+cy+'" r="'+R.toFixed(1)+'" fill="none" stroke="#2e4432" stroke-width="0.8" stroke-dasharray="3,3"/>';
+  // R_max reference ring (faint) so the relative scale is visually legible
+  var refRing = R < maxDiskPx
+    ? '<circle cx="'+cx+'" cy="'+cy+'" r="'+maxDiskPx.toFixed(1)+'" fill="none" stroke="#1a2a1a" stroke-width="0.5" stroke-dasharray="1,4"/>'
+    : '';
+  var hub    = '<circle cx="'+cx+'" cy="'+cy+'" r="'+hubR.toFixed(1)+'" fill="#0c0e0c" stroke="'+diskColor+'" stroke-width="1.0"/>';
+  var rLabel = R_m.toFixed(3)+' m';
+  var label  = '<text x="'+cx+'" y="'+(S-6)+'" text-anchor="middle" font-family="B612 Mono,monospace" font-size="11" fill="#618a6b">R'+r.rotor_id+' · '+rLabel+'</text>';
+
+  return '<svg xmlns="http://www.w3.org/2000/svg" width="'+S+'" height="'+S+'" viewBox="0 0 '+S+' '+S+'" style="background:#0c0e0c;border:1px solid #243520;border-radius:2px">'
+    + refRing + disk + blades + hub + label + '</svg>';
+}
+
+function renderRotorDisks(rotors){
+  var el = document.getElementById('rotor-disks');
+  if(!rotors.length){ el.innerHTML=''; return; }
+  var n = rotors.length;
+  // Fleet-wide max radius — sets the common scale reference
+  var R_max = Math.max.apply(null, rotors.map(function(r){ return r.R_m || 1.45; }));
+  // ≤6 rotors: single row; >6: wrap at 4 columns
+  var cols = n<=6 ? n : 4;
+  var tileSize = n<=6 ? Math.min(170, Math.floor(900/n)) : 150;
+  var html = '<div style="display:grid;grid-template-columns:repeat('+cols+','+tileSize+'px);gap:12px;margin-top:12px">';
+  rotors.forEach(function(r){ html += buildDiskSVG(r, tileSize, R_max); });
+  html += '</div>';
+  el.innerHTML = html;
 }
 
 function renderChecklist(){
@@ -709,7 +806,11 @@ class _Handler(BaseHTTPRequestHandler):
 
         elif path == "/rotors":
             rows = read_rotor_csv()
-            payload = json.dumps({"rotors": rows, "path": str(ROTOR_CSV)}).encode()
+            n = len(rows)
+            error = None
+            if n > 0 and not (2 <= n <= 8):
+                error = f"Invalid rotor count: {n}. Fleet must have 2–8 rotors."
+            payload = json.dumps({"rotors": rows, "path": str(ROTOR_CSV), "error": error}).encode()
             self._send(200, "application/json", payload)
 
         elif path == "/card":
