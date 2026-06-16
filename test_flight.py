@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
-# test_flight.py:  Unified flight test runner
-# AUTHOR:          DANIEL DESAI
-# UPDATED:         2026-05-10
-# VERSION:         0.1.0
+#
+# <fly.jl>:   <Unified flight test runner>
+# <Author>:   <DANIEL DESAI>
+# <Updated>:  <2026-06-15>
+# <Version>:  <0.1.1>
 
 """
 Usage:
@@ -56,6 +57,8 @@ import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
+
+import numpy as np
 
 # ── Repo layout ───────────────────────────────────────────────────────────────
 ROOT     = Path(__file__).parent.resolve()
@@ -444,26 +447,39 @@ def _download_tile(tile: str, cache_dir: Path) -> Optional[Path]:
 
 
 def _read_hgt(path: Path):
-    data = path.read_bytes(); n = int(math.sqrt(len(data)//2))
-    grid = [[None]*n for _ in range(n)]
-    for r in range(n):
-        for c in range(n):
-            v = struct.unpack(">h", data[2*(r*n+c):2*(r*n+c)+2])[0]
-            grid[r][c] = float("nan") if v==-32768 else float(v)
+    # np.frombuffer replaces an O(n²) Python loop (1201×1201 = 1.44M iters for SRTM3).
+    # >i2 = big-endian int16, matching the HGT binary spec.
+    data   = path.read_bytes()
+    n      = int(math.sqrt(len(data) // 2))
+    grid   = np.frombuffer(data, dtype=">i2").reshape(n, n).astype(np.float64)
+    grid   = np.ascontiguousarray(grid)  # ensure writeable copy for nan assignment
+    grid[grid == -32768] = np.nan
     stem   = path.stem
-    lat_sw = float(stem[1:3])*(-1 if stem[0]=='S' else 1)
-    lon_sw = float(stem[4:7])*(-1 if stem[3]=='W' else 1)
+    lat_sw = float(stem[1:3]) * (-1 if stem[0] == "S" else 1)
+    lon_sw = float(stem[4:7]) * (-1 if stem[3] == "W" else 1)
     return grid, lat_sw, lon_sw
 
 
 def _sample(grids, lat, lon):
     t = _tile_name(lat, lon)
-    if t not in grids: return float("nan")
-    grid,lat_sw,lon_sw = grids[t]; n=len(grid); step=1/(n-1)
-    rf=(lat_sw+1-lat)/step; cf=(lon-lon_sw)/step
-    r0=max(0,min(int(rf),n-2)); c0=max(0,min(int(cf),n-2)); fr,fc=rf-r0,cf-c0
-    def g(r,c): v=grid[r][c]; return 0.0 if math.isnan(v) else v
-    return g(r0,c0)*(1-fr)*(1-fc)+g(r0,c0+1)*(1-fr)*fc+g(r0+1,c0)*fr*(1-fc)+g(r0+1,c0+1)*fr*fc
+    if t not in grids:
+        return np.nan
+    grid, lat_sw, lon_sw = grids[t]
+    n    = grid.shape[0]
+    step = 1.0 / (n - 1)
+    rf = (lat_sw + 1 - lat) / step
+    cf = (lon - lon_sw) / step
+    r0 = int(np.clip(rf, 0, n - 2))
+    c0 = int(np.clip(cf, 0, n - 2))
+    fr, fc = rf - r0, cf - c0
+    # Bilinear interpolation; NaN cells treated as zero (sea/void fill)
+    def g(r, c):
+        v = grid[r, c]
+        return 0.0 if np.isnan(v) else float(v)
+    return (g(r0,   c0  ) * (1-fr) * (1-fc)
+          + g(r0,   c0+1) * (1-fr) * fc
+          + g(r0+1, c0  ) * fr     * (1-fc)
+          + g(r0+1, c0+1) * fr     * fc)
 
 
 def build_terrain_profile(dep: Airport, arr: Airport,
@@ -484,15 +500,16 @@ def build_terrain_profile(dep: Airport, arr: Airport,
     if missing: warn(f"Terrain: {len(missing)} unavailable {sorted(missing)} — linear fallback")
     if not grids: return None
     dist_m = haversine(dep.lat, dep.lon, arr.lat, arr.lon)
-    xs, zs = [], []
-    for i in range(n_pts):
-        f   = i/(n_pts-1)
-        la  = dep.lat+f*(arr.lat-dep.lat); lo = dep.lon+f*(arr.lon-dep.lon)
-        elv = _sample(grids, la, lo)
-        xs.append(round(f*dist_m,1))
-        zs.append(round(elv,1) if not math.isnan(elv)
-                  else round(dep.elev_m+f*(arr.elev_m-dep.elev_m),1))
-    info(f"Terrain: {n_pts} pts  elev {min(zs):.0f}–{max(zs):.0f} m")
+    fs      = np.linspace(0.0, 1.0, n_pts)
+    lats    = dep.lat + fs * (arr.lat - dep.lat)
+    lons    = dep.lon + fs * (arr.lon - dep.lon)
+    xs      = (fs * dist_m).round(1).tolist()
+    # _sample is scalar; vectorize over the 200 waypoints
+    fallback = dep.elev_m + fs * (arr.elev_m - dep.elev_m)
+    raw_elv  = np.array([_sample(grids, la, lo) for la, lo in zip(lats, lons)])
+    zs_arr   = np.where(np.isnan(raw_elv), fallback, raw_elv).round(1)
+    zs       = zs_arr.tolist()
+    info(f"Terrain: {n_pts} pts  elev {zs_arr.min():.0f}–{zs_arr.max():.0f} m")
     return {"x_m": xs, "elev_m": zs, "origin_elev_m": dep.elev_m,
             "source": "SRTM GL3", "dep": dep.icao, "arr": arr.icao, "n_points": n_pts}
 
@@ -620,118 +637,6 @@ def build_autopilot() -> str:
 
     return ver
 
-
-def build_blades() -> str:
-    """
-    Compile blades.hpp directly to a versioned blades.so.
-
-    blades.hpp is header-only; we compile it directly with -x c++ rather than
-    maintaining a separate blades.cpp wrapper.  -DBLADES_EXPORT activates the
-    extern "C" ABI block at the bottom of blades.hpp.  Versioned filenames
-    force Julia to dlopen fresh on every run.
-    """
-    propulsion = ROOT / "subsystems" / "propulsion"
-    hpp        = propulsion / "blades.hpp"
-    if not hpp.exists():
-        raise FileNotFoundError(f"blades.hpp not found at {hpp}")
-
-    ver  = str(int(time.time()))
-    so   = propulsion / f"blades_{ver}.so"
-    info(f"Compiling blades_{ver}.so")
-    # -x c++ tells g++ to treat .hpp as C++;
-    # suppresses the harmless warning from compiling a header as a main file.
-    flags = ["-x", "c++", "-DBLADES_EXPORT", "-fvisibility=default"]
-    if not _compile_so(hpp, so, extra_flags=flags):
-        raise RuntimeError("blades build failed")
-    (propulsion / "blades.version").write_text(ver)
-    r_nm = subprocess.run(["nm", "-D", str(so)], capture_output=True, text=True)
-    for sym in ("blades_blade_coefficients", "blades_vrs_factor"):
-        if sym not in r_nm.stdout:
-            so.unlink(missing_ok=True)
-            (propulsion / "blades.version").unlink(missing_ok=True)
-            raise RuntimeError(
-                f"blades build produced {so.name} but '{sym}' is missing from exports.")
-    success(f"blades_{ver}.so")
-    for old in sorted(propulsion.glob("blades_*.so"),
-                      key=lambda p: p.stat().st_mtime, reverse=True)[1:]:
-        old.unlink(); info(f"Pruned {old.name}")
-    return ver
-
-
-def build_fly() -> str:
-    """
-    Compile state/fly.cpp to a versioned fly.so.
-
-    Requires:
-      - ../eigen (Eigen header-only library, one level above repo root)
-      - ../subsystems/propulsion (for blades.hpp, included by fly.cpp)
-    Both are passed as -I flags; no linking against blades.so is needed since
-    blades.hpp is #included directly into fly.cpp.
-    """
-    state_dir  = ROOT / "state"
-    src        = state_dir / "fly.cpp"
-    # Find the Eigen header tree — check both cases since the folder is
-    # commonly named "eigen" or "Eigen" depending on how it was extracted.
-    _eigen_parent = ROOT.parent
-    eigen_dir = next(
-        (p for name in ("Eigen", "eigen")
-         for p in [_eigen_parent / name] if p.exists()),
-        _eigen_parent / "Eigen")   # fallback — will fail with clear error below
-    prop_dir   = ROOT / "subsystems" / "propulsion"
-
-    if not src.exists():
-        raise FileNotFoundError(f"fly.cpp not found at {src}")
-    if not eigen_dir.exists():
-        raise FileNotFoundError(
-            f"Eigen not found at {eigen_dir}\n"
-            f"Place the Eigen 5.0.0 header tree one level above the repo root: {eigen_dir}")
-    # Resolve the correct -I path for #include <Eigen/Core>.
-    # The -I path must be the parent of the Eigen/ folder, so that the
-    # compiler finds <I>/Eigen/Core.
-    #
-    # eigen_dir is already "Eigen" or "eigen" (the header folder itself).
-    # Its parent is the correct -I path.  Verify by checking that Core
-    # exists directly inside eigen_dir (flat layout confirmed on this machine).
-    if (eigen_dir / "Core").exists():
-        # eigen_dir IS the Eigen/ folder — -I must be its parent
-        eigen_dir = eigen_dir.parent
-        info(f"Eigen -I path: {eigen_dir}  (eigen_dir/Eigen/Core = {eigen_dir}/Eigen/Core)")
-    elif (eigen_dir / "Eigen" / "Core").exists():
-        # eigen_dir already correct — contains an Eigen/ subdirectory
-        pass
-    else:
-        raise FileNotFoundError(
-            f"Eigen headers not found.\n"
-            f"Checked: {eigen_dir}/Core and {eigen_dir}/Eigen/Core\n"
-            f"Ensure the Eigen 5.0.0 folder (named 'Eigen' or 'eigen') "
-            f"is at {ROOT.parent}/")
-
-    ver  = str(int(time.time()))
-    so   = state_dir / f"fly_{ver}.so"
-    info(f"Compiling fly_{ver}.so")
-    flags = ["-fvisibility=default", f"-I{eigen_dir}", f"-I{prop_dir}"]
-    if not _compile_so(src, so, extra_flags=flags):
-        raise RuntimeError("fly build failed")
-    # Verify the expected C symbols are exported BEFORE writing fly.version,
-    # so a failed check leaves no stale version file pointing to a bad .so.
-    r_nm = subprocess.run(["nm", "-D", str(so)], capture_output=True, text=True)
-    for sym in ("fly_run", "fly_abort"):
-        if sym not in r_nm.stdout:
-            so.unlink(missing_ok=True)
-            raise RuntimeError(
-                f"fly build produced {so.name} but '{sym}' is missing from exports.\n"
-                f"g++ stderr: {r_nm.stderr.strip() or '(none)'}\n"
-                f"nm output (first 20 lines):\n" +
-                "\n".join(r_nm.stdout.splitlines()[:20]) +
-                f"\nCheck that -I flags are correct and blades.hpp was found.\n"
-                f"  eigen_dir = {eigen_dir}\n"
-                f"  prop_dir  = {prop_dir}")
-    (state_dir / "fly.version").write_text(ver)
-    success(f"fly_{ver}.so")
-    for old in sorted(state_dir.glob("fly_*.so"),
-                      key=lambda p: p.stat().st_mtime, reverse=True)[1:]:
-        old.unlink(); info(f"Pruned {old.name}")
-    return ver
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1411,12 +1316,7 @@ def main():
         header("Building")
         if not args.no_build:
             try:
-                build_autopilot()   # flight controller — always needed
-                # blades.so and fly.so only needed for --solver cpp
-                # (Julia solver uses blades.jl and OrdinaryDiffEq directly)
-                if (ROOT / "subsystems" / "propulsion" / "blades.hpp").exists():
-                    build_blades()
-                    build_fly()
+                build_autopilot()   # flight controller 
             except Exception as e:
                 fail(str(e)); sys.exit(2)
         else:
@@ -1427,8 +1327,7 @@ def main():
                 existing = sorted(vf.parent.glob(f"{glob_name}_*.so"),
                                   key=lambda p: p.stat().st_mtime, reverse=True)
                 return existing[0].name if existing else f"{glob_name}.so (no version file)"
-            info(f"--no-build: {_ver_label(ROOT/'subsystems'/'propulsion'/'blades.version', 'blades')}")
-            info(f"--no-build: {_ver_label(ROOT/'state'/'fly.version', 'fly')}")
+            # info(f"--no-build: blades/fly.so labels omitted — C++ solver disabled")
             info(f"--no-build: {_ver_label(CONTROLS/'autopilot.version', 'autopilot')}")
 
     # ── 3: Simulate ───────────────────────────────────────────────────
