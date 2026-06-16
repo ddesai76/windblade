@@ -1,14 +1,13 @@
 # WINDBLADE
 
-eVTOL tiltrotor flight simulation through full mission profiles.
+Advanced Air Mobility Model-Based Prototyping 
 
-**Reference route:** KAXX → KSAF — 114.8 km, 219°, −619 m elevation change
 
 ---
 
 ## Architecture
 
-WINDBLADE is a multi-language simulation stack. Each layer owns a distinct concern:
+WINDBLADE is a multi-language eVTOL tiltrotor simulation stack. Each layer owns a distinct concern:
 
 | Layer | Language | Role |
 |---|---|---|
@@ -161,7 +160,7 @@ python3 test_flight.py --out results/r1
 | Code | Meaning |
 |---|---|
 | 0 | All checks passed |
-| 1 | One or more test_executive checks failed |
+| 1 | One or more test criticalities failed |
 | 2 | Build failed |
 | 3 | Sim failed / no CSV produced |
 | 4 | Flight planning failed |
@@ -171,7 +170,7 @@ python3 test_flight.py --out results/r1
 
 ## Rotor Configuration
 
-Rotor geometry is defined in `subsystems/propulsion/rotor_config.csv`. Default configuration is six S4-class rotors:
+Rotor geometry is defined in `subsystems/propulsion/rotor_config.csv`. Default configuration is six electric rotors:
 
 | Parameter | Value |
 |---|---|
@@ -182,6 +181,7 @@ Rotor geometry is defined in `subsystems/propulsion/rotor_config.csv`. Default c
 | Pitch offset | 4.4° |
 | Max power | 236 kW per rotor |
 | Hover RPM | 1284 |
+| Powerplant | electric |
 
 Edit `rotor_config.csv` and reload the Rotor Config tab in the GUI to apply changes without restart.
 
