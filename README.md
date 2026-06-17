@@ -11,7 +11,7 @@ WINDBLADE is a multi-language tiltrotor simulation stack. Each layer owns a dist
 | Launcher / GUI | Python | Mission planner, browser UI, test runner |
 | Physics / ODE | Julia | BEM rotor model, state integrator, glass cockpit |
 | Autopilot | C++ | Flight controller compiled to `autopilot.so` |
-| HOTAS input | C | Joystick reader compiled to `controls/hotas` |
+| HOTAS input | C | Manual flight controls reader compiled to `controls/hotas` |
 
 The Julia ODE solver calls into `autopilot.so` via `@ccall` at each save step. The Python launcher (`windblade.py`) orchestrates builds, planning, and the Julia subprocess. Manual flight reads the HOTAS device via a separate C process piped into the Julia ODE loop.
 
@@ -32,7 +32,7 @@ windblade/
 ├── planning/
 │   ├── mission_planner.jl              # Phase scheduler and timing constants
 │   ├── navigation.jl                   # Waypoint guidance and nav map state
-│   └── test_card.json                  # Single source of truth for mission parameters
+│   └── test_card.json                  # Source of truth for mission parameters
 │
 ├── subsystems/
 │   ├── airframe.jl                     # Aerodynamics and body forces
@@ -41,19 +41,15 @@ windblade/
 │   ├── landing_gear.jl                 # Three-point compliant strut contact model
 │   └── propulsion/
 │       ├── blades.jl                   # Blade element momentum (BEM) implementation
-│       ├── powerplant.jl               # Motor/engine backends — electric, turboshaft, hybrid
-│       ├── fuel.jl                     # Fuel chemistry and tank capacity — required at load
-│       │                               #   time by powerplant.jl even for an all-electric
-│       │                               #   fleet (TurboshaftEngine's struct definition
-│       │                               #   references FuelTank regardless of rotor_config.csv)
+│       ├── powerplant.jl               # Motor/engine backends — electric, turboshaft
+│       ├── fuel.jl                     # Fuel chemistry and tank capacity
 │       ├── rotor_system.jl             # Powerplant top-level model
 │       ├── rotor_mixer.jl              # Wrench-to-RPM control allocator
 │       └── rotor_config.csv            # Per-rotor geometry and power parameters
 │
 └── world/
     ├── atmosphere.jl                   # Troposphere ISA model (0–11000 m MSL)
-    ├── terrain.jl                      # Piecewise-linear ground-track elevation
-    └── sensors.jl                      # Sensor interface stubs
+    └── terrain.jl                      # Piecewise-linear ground-track elevation
 ```
 
 ## State Vector
@@ -99,7 +95,6 @@ States 19–22 added with Dryden turbulence (MIL-HDBK-1797B). The C++ autopilot 
 
 **C++ build**
 - g++ with C++17
-- Eigen (expected at `../eigen` relative to repo root)
 
 **HOTAS (optional)**
 - Linux only — reads `/dev/input/js0` via joydev kernel interface
@@ -162,7 +157,7 @@ Exit codes:
 
 ## Rotor Configuration
 
-Rotor geometry is defined in `subsystems/propulsion/rotor_config.csv`. Default configuration is a mixed fleet — two turbine-electric rotors (R1/R2) and four electric rotors (R3–R6):
+Rotor geometry is defined in `subsystems/propulsion/rotor_config.csv`. Default configuration is an all-electric rotor fleet, however mixed fleets are supported as in the below example with two turbine-electric rotors (R1/R2) and four electric rotors (R3–R6):
 
 **Turbine-electric (R1/R2):**
 
@@ -190,8 +185,8 @@ Rotor geometry is defined in `subsystems/propulsion/rotor_config.csv`. Default c
 | Hover RPM | 1260 |
 | Powerplant | `electric` |
 
-Edit `rotor_config.csv` and reload the Rotor Config tab in the GUI to apply changes without restart. A `turbine_electric` row requires a fuel tank; see `fuel.jl` for tank capacity (`FuelTank`) and fuel chemistry (`FuelProperties` — Jet-A and SAF defined) parameters, and `powerplant.jl` for the `TurboshaftEngine` model (Gagg–Ferrar altitude lapse, derived SFC from thermal efficiency). Both files are loaded unconditionally by `rotor_system.jl` regardless of fleet composition.
+Edit `rotor_config.csv` and reload the Rotor Config tab in the GUI to apply changes without restart. A `turbine_electric` row requires fuel tank; see `fuel.jl` for tank capacity (`FuelTank`) and fuel chemistry (`FuelProperties` — Jet-A and SAF defined) parameters. `powerplant.jl` implements a `TurboshaftEngine` model (Gagg–Ferrar altitude lapse, derived SFC from thermal efficiency). Both files are loaded unconditionally by `rotor_system.jl` regardless of fleet composition.
 
 ## Author
 
-DANIEL DESAI — v0.1.0
+DANIEL DESAI — v0.1.1
