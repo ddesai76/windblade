@@ -1,7 +1,7 @@
-# glass_cockpit.jl:   eVTOL Tiltrotor Sim Glass Cockpit MIL-STD-3009 NVG
+# glass_cockpit.jl:    Tiltrotor Sim Glass Cockpit MIL-STD-3009 NVG
 # AUTHOR:              DANIEL DESAI
-# UPDATED:             2026-05-10
-# VERSION:             0.1.0
+# UPDATED:             2026-06-17
+# VERSION:             0.1.1
 #
 # GLMakie real-time instrument panel — NVG-compatible colour theme
 # per MIL-STD-3009 (Lighting, Aircraft, Night Vision Imaging System).
@@ -429,9 +429,7 @@ function draw_tilt!(ax, tilt_deg)
     nac_len = 38.0               # length in data units
     tip = Point2f(ox + tx*nac_len, oy + ty*nac_len)
     lines!(ax, [Point2f(ox, oy), tip],
-           color=TH.stroke_hi, linewidth=8.0, linecap=:round)
-    lines!(ax, [Point2f(ox, oy), tip],
-           color=TH.text_dim,   linewidth=4.5, linecap=:round)
+           color=TH.green,   linewidth=1.8)
 
     # ── Rotor disk: short line perpendicular to nacelle at tip ────────
     disk_r = 14.0
@@ -454,7 +452,7 @@ function draw_tilt!(ax, tilt_deg)
           color=TH.green, strokewidth=0)
 
     # ── Mode string and angle readout ─────────────────────────────────
-    mode_str = tilt_deg < 20 ? "HOVER" : tilt_deg > 80 ? "CRUISE" : "TRANS"
+    mode_str = tilt_deg < 20 ? "HOVER" : tilt_deg > 80 ? "CRUISE" : "TRANSITION"
     text!(ax, 50.0, 96.0, text="NACELLE TILT",
           fontsize=9, color=TH.text_label, align=(:center, :center), font=LABEL_FONT)
     text!(ax, 50.0,  7.0,
@@ -586,7 +584,7 @@ function draw_contact!(ax, contact::Bool, strut_load_n::Float64,
         poly!(ax, [Point2f(0.06, 0.32), Point2f(0.94, 0.32),
                    Point2f(0.94, 0.68), Point2f(0.06, 0.68)],
               color=RGBAf(0,0,0,0), strokecolor=TH.stroke, strokewidth=0.8)
-        text!(ax, 0.5, 0.50, text="· · ·",
+        text!(ax, 0.5, 0.50, text="- - -",
               fontsize=10, color=TH.text_faint,
               align=(:center, :center), font=LABEL_FONT)
     end
@@ -948,7 +946,7 @@ function draw_nav_map!(ax, snap)
     agl_m   = snap.alt
     agl_ft  = agl_m * 3.28084
     agl_str = @sprintf("%.0f ft", agl_ft)
-    brg_str = @sprintf("BRG %03d°", round(Int, brg))
+    brg_str = @sprintf("%03d°", round(Int, brg))
 
     # AGL colour — threshold depends on flight phase
     agl_col = if phase == "dash"
@@ -962,9 +960,12 @@ function draw_nav_map!(ax, snap)
     end
 
     # BRG small label (upper left)
-    text!(ax, -0.96, -0.73,
-          text=brg_str, fontsize=10, color=TH.text_dim,
+    text!(ax, -0.96, -0.56,
+          text="BRG", fontsize=10, color=TH.text_dim,
           align=(:left, :center), font=LABEL_FONT)
+    text!(ax, -0.96, -0.67,
+          text=brg_str, fontsize=22, color=wp_col,
+          align=(:left, :center), font=DISP_FONT)
 
     # RNG — large (lower left)
     text!(ax, -0.96, -0.83,
