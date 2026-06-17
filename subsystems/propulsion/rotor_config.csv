@@ -1,7 +1,7 @@
-rotor_id,R_m,n_blades,style,sweep_deg,chord_m,chord_root_m,chord_tip_m,t_root_m,t_tip_m,twist_root_deg,twist_tip_deg,pitch_offset_deg,P_max_kW,rpm_hover,notes
-1,1.45,5,stock,12,0.096,0.069,0.053,0.014,0.006,16,6,4.4,236,1284,Stock S4-class port-front
-2,1.45,5,stock,12,0.096,0.069,0.053,0.014,0.006,16,6,4.4,236,1284,Stock S4-class starboard-front
-3,1.45,5,stock,12,0.096,0.069,0.053,0.014,0.006,16,6,4.4,236,1284,Stock S4-class port-mid
-4,1.45,5,stock,12,0.096,0.069,0.053,0.014,0.006,16,6,4.4,236,1284,Stock S4-class starboard-mid
-5,1.45,5,stock,12,0.096,0.069,0.053,0.014,0.006,16,6,4.4,236,1284,Stock S4-class port-rear
-6,1.45,5,stock,12,0.096,0.069,0.053,0.014,0.006,16,6,4.4,236,1284,Stock S4-class starboard-rear
+rotor_id,R_m,n_blades,chord_m,twist_root_deg,twist_tip_deg,pitch_offset_deg,P_max_kW,rpm_hover,powerplant,notes
+3,1.45,5,0.096,16,6,4.4,280,1260,electric,
+3,1.45,5,0.096,16,6,4.4,280,1260,electric,
+3,1.45,5,0.096,16,6,4.4,280,1260,electric,
+4,1.45,5,0.096,16,6,4.4,280,1260,electric,
+5,1.45,5,0.096,16,6,4.4,280,1260,electric,
+6,1.45,5,0.096,16,6,4.4,280,1260,electric,
