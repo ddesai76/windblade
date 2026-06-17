@@ -1,9 +1,8 @@
 # airframe.jl:     Airframe and aerodynamics subsystem
 # AUTHOR:          DANIEL DESAI
-# UPDATED:         2026-05-10
-# VERSION:         0.1.0
+# UPDATED:         2026-06-17
+# VERSION:         0.1.1
 #
-# Fixed-wing and hover aerodynamics for a tiltrotor eVTOL.
 #
 # Coordinate convention:
 #   x — forward (positive = forward)
@@ -46,7 +45,32 @@ end
 const AP = AirframeParams()
 
 const G        = 9.80665
-const WEIGHT_N = AP.mass_kg * G
+
+"""
+    weight_N(ap::AirframeParams = AP) → N
+
+Aircraft weight in Newtons for the given AirframeParams instance.
+Use this instead of `WEIGHT_N` anywhere mass can vary at runtime (e.g.
+mission-variable fuel loading constructing a fresh `AirframeParams(mass_kg=...)`
+at launch) — `WEIGHT_N` below is a module-load-time snapshot of the
+*default* `AP.mass_kg` and does not update if a different `ap` is used.
+
+NOTE (2026-06-17): the mission-variable construction described above is
+not yet implemented anywhere in this codebase — mission_planner.jl has
+no mass_kg/fuel field, and nothing currently builds a non-default
+AirframeParams. AP.mass_kg is therefore always 2177.0 (the struct
+default) regardless of mission. This function and the WEIGHT_N fix
+below are forward-looking: correct now, and correct once that wiring
+is added, but not yet exercised by any live mission-mass value. See
+the turbine-electric roadmap, Section 06 task list and AC-13.
+"""
+weight_N(ap::AirframeParams = AP) = ap.mass_kg * G
+
+# Retained for backward compatibility with any existing caller that
+# references WEIGHT_N directly. New code, and any caller that needs to
+# reflect a non-default AirframeParams (e.g. mission-variable fuel load),
+# should call weight_N(ap) instead — see that function's docstring.
+const WEIGHT_N = weight_N(AP)
 
 # ── Body / Fuselage Drag ──────────────────────────────────────────────
 
@@ -312,7 +336,7 @@ future refinement could convert v[IDX.speed] to IAS using
 """
 function vcon_limits(tilt_rad::Float64, alt_agl_m::Float64;
                      ap::AirframeParams = AP,
-                     weight_n::Float64  = WEIGHT_N) ::
+                     weight_n::Float64  = weight_N(ap)) ::
          NamedTuple{(:lo_kmh, :hi_kmh), Tuple{Float64, Float64}}
 
     # ── Lower bound: wing-lift share at this tilt angle ───────────────
