@@ -91,7 +91,8 @@ States 19–22 added with Dryden turbulence (MIL-HDBK-1797B). The C++ autopilot 
 - ForwardDiff.jl
 
 **Python (3.10+)**
-- Standard library only (no pip installs required)
+- numpy
+- matplotlib
 
 **C++ build**
 - g++ with C++17
