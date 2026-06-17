@@ -2,8 +2,8 @@
 #
 # windblade.py:   Mission Planner and Launcher GUI
 # AUTHOR:         DANIEL DESAI
-# UPDATED:        2026-06-15
-# VERSION:        0.1.1
+# UPDATED:        2026-06-17
+# VERSION:        0.1.2
 
 """
 Single-file entry point.  Run and a browser window opens with the
@@ -90,8 +90,8 @@ def read_rotor_csv() -> list[dict]:
                     "pitch_offset_deg":  float(row["pitch_offset_deg"].strip()),
                     "P_max_kW":          float(row["P_max_kW"].strip()),
                     "rpm_hover":         float(row["rpm_hover"].strip()),
-                    "powerplant":   row.get("powerplant", "electric").strip(),
-                    "notes":             row.get("notes","").strip(),
+                    "powerplant":   (row.get("powerplant") or "electric").strip(),
+                    "notes":             (row.get("notes") or "").strip(),
                 })
             except (KeyError, ValueError):
                 continue
@@ -381,7 +381,7 @@ var running=false;
 var rotorData=[];
 
 var POSITIONS=['fwd-port','fwd-stbd','mid-port','mid-stbd','aft-port','aft-stbd'];
-var S4={R_m:1.524,n_blades:3,chord_m:0.12,twist_root_deg:16.0,twist_tip_deg:6.0,pitch_offset_deg:4.4,P_max_kW:280,rpm_hover:1250};
+var S4={R_m:1.45,n_blades:5,chord_m:0.096,twist_root_deg:16.0,twist_tip_deg:6.0,pitch_offset_deg:4.4,P_max_kW:280,rpm_hover:1260};
 
 function nav(id,el){
   document.querySelectorAll('.panel').forEach(p=>p.classList.remove('active'));
@@ -461,7 +461,7 @@ function loadRotors(){
 function propCls(t){
   if(t==='electric')return 'c-ok';
   if(t==='turboshaft')return 'c-warn';
-  if(t==='turbine-electric')return 'c-dim';
+  if(t==='turbine_electric')return 'c-dim';
   return '';
 }
 
