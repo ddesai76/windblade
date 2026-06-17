@@ -1,28 +1,43 @@
 # rotor_system.jl:    Powerplant top-level model
 # AUTHOR:             DANIEL DESAI
-# UPDATED:            2026-05-10
-# VERSION:            0.1.0
+# UPDATED:            2026-06-17
+# VERSION:            0.1.2
 #
 # Motor swap patterns (all produce a valid RotorParams / RotorFleet):
 # ──────────────────────────────────────────────────────────────────────
 #   All-turboshaft:
 #     RP.motor = TurboshaftEngine(P_sl_W=1_200_000.0)
 #
-#   All-hybrid:
+#   All-hybrid (Mode 2/3 — NOT Phase 1):
 #     RP.motor = HybridTurbineElectric(turbine=TurboshaftEngine(P_sl_W=400_000.0),
 #                                       motor=ElectricMotor(P_max_W=250_000.0),
 #                                       E_batt_J=3.6e8)
+#
+#   R1/R2 turbogenerator prototype (Mode 1, Phase 1 target):
+#     tank = FuelTank(45.0, 24.4)   # capacity_L, initial_L — see fuel.jl
+#     ts   = TurboshaftEngine(tank = tank)   # 746 kW, eta=1/3 design point
+#     FLEET_TE = RotorFleet(Dict(1 => RotorUnit(_default_unit(1); motor=ts),
+#                                2 => RotorUnit(_default_unit(2); motor=ts)))
+#     Note: ts is intentionally the SAME instance on both units so
+#     tank.mass_kg is shared (one tank, two units drawing from it) — see
+#     "Shared fuel tank" note near _default_unit below. Battery-independent
+#     per Mode 1 spec — no HybridTurbineElectric coupling.
 #
 #   Mixed fleet — aft pair turboshaft:
 #     ts = TurboshaftEngine(P_sl_W=600_000.0)
 #     FLEET_TS = RotorFleet(Dict(5 => RotorUnit(_default_unit(5); motor=ts),
 #                                6 => RotorUnit(_default_unit(6); motor=ts)))
 #
-# Depends on: blades.jl, atmosphere.jl
+# Depends on: blades.jl (BEM aerodynamics), powerplant.jl (motor backends,
+# includes fuel.jl for fuel chemistry/tank capacity), atmosphere.jl
+# powerplant.jl moved out of blades.jl on 2026-06-17 — see that file's
+# header for the AbstractMotor hierarchy and the no-gearbox design note.
 
 
 include("blades.jl")
 using .Blades
+include("powerplant.jl")
+using .Powerplant
 
 # ── Single Rotor Unit ──────────────────────────────────────────────────
 """
@@ -149,6 +164,19 @@ end
 # ── Rotor fleet: S4 defaults, with optional overrides from test_card.json ──
 # test_flight.py / windblade.py write rotor geometry into test_card.json under
 # "rotor_fleet" → "overrides". Edit rotor_config.csv and re-run to customise.
+#
+# Override entry schema (per rotor_id):
+#   R_m, n_blades, chord_m, twist_root_deg, twist_tip_deg, pitch_offset_deg — geometry
+#   P_max_kW, rpm_hover                                                     — performance
+#   powerplant — "electric" (default) | "turbine_electric"
+#                "turbine_electric" builds a TurboshaftEngine instead of ElectricMotor.
+#                P_max_kW is interpreted as TurboshaftEngine.P_sl_W for this powerplant.
+#
+# Shared fuel tank: if multiple override entries share the same
+# "fuel_tank_id" string (e.g. both R1 and R2 set "fuel_tank_id": "TG_FWD"),
+# they receive the SAME TurboshaftEngine instance, so fuel_kg depletes from
+# one shared pool regardless of which rotor's dispatch calls burn_fuel!().
+# Entries with no fuel_tank_id each get their own independent instance.
 const FLEET = let
     _card_path = joinpath(dirname(dirname(@__DIR__)), "planning", "test_card.json")
     _ovrs = try
@@ -160,6 +188,8 @@ const FLEET = let
         RotorFleet()
     else
         _od = Dict{Int,RotorUnit}()
+        _shared_turboshafts = Dict{String,TurboshaftEngine}()  # fuel_tank_id => shared instance
+
         for entry in _ovrs
             id = Int(entry["rotor_id"])
             u  = _default_unit(id)
@@ -172,8 +202,35 @@ const FLEET = let
                 twist_tip_deg    = get(entry, "twist_tip_deg",     bg.twist_tip_deg),
                 pitch_offset_deg = get(entry, "pitch_offset_deg",  bg.pitch_offset_deg),
             )
-            _P_max_W = get(entry, "P_max_kW", u.motor.P_max_W / 1000.0) * 1000.0
-            _omega   = get(entry, "rpm_hover", u.omega_nom * 60.0 / (2π)) * 2π / 60.0
+            _omega = get(entry, "rpm_hover", u.omega_nom * 60.0 / (2π)) * 2π / 60.0
+
+            _powerplant = get(entry, "powerplant", "electric")
+            _motor = if _powerplant == "turbine_electric"
+                _P_sl_W = get(entry, "P_max_kW", 746.0) * 1000.0
+                _tank_id = get(entry, "fuel_tank_id", nothing)
+                _build_tank() = FuelTank(
+                    get(entry, "fuel_capacity_L", 45.0),
+                    get(entry, "fuel_initial_L",  24.4),
+                )
+                if _tank_id !== nothing
+                    # Shared tank: reuse the same instance across all entries
+                    # carrying this fuel_tank_id, so tank.mass_kg is one
+                    # shared pool. Capacity/initial load come from whichever
+                    # entry is processed first for this tank_id.
+                    get!(_shared_turboshafts, _tank_id) do
+                        TurboshaftEngine(P_sl_W = _P_sl_W, tank = _build_tank())
+                    end
+                else
+                    TurboshaftEngine(P_sl_W = _P_sl_W, tank = _build_tank())
+                end
+            elseif _powerplant == "electric"
+                _P_max_W = get(entry, "P_max_kW", 280.0) * 1000.0
+                ElectricMotor(P_max_W = _P_max_W)
+            else
+                error("FLEET override rotor $id: unknown powerplant \"$_powerplant\". " *
+                      "Use \"electric\" or \"turbine_electric\".")
+            end
+
             _od[id] = RotorUnit(
                 id         = u.id,
                 label      = u.label,
@@ -190,15 +247,17 @@ const FLEET = let
                 arm_z_m    = u.arm_z_m,
                 spin_dir   = u.spin_dir,
                 blade_geom = new_bg,
-                motor      = ElectricMotor(P_max_W=_P_max_W),
+                motor      = _motor,
             )
         end
         @info "Custom rotor geometry: $(length(_od)) rotor(s) overridden"
         for (id, u) in sort(collect(_od), by=first)
-            @printf("  R%d: R=%.3fm  chord=%.3fm  n_blades=%d  rpm_nom=%.0f  P_max=%.0f kW
+            _p_kw = u.motor isa ElectricMotor    ? u.motor.P_max_W / 1000.0 :
+                    u.motor isa TurboshaftEngine ? u.motor.P_sl_W  / 1000.0 : NaN
+            @printf("  R%d: R=%.3fm  chord=%.3fm  n_blades=%d  rpm_nom=%.0f  P_max=%.0f kW  motor=%s
 ",
                     id, u.radius_m, u.blade_geom.chord, u.blade_geom.n_blades,
-                    u.omega_nom * 60.0 / (2π), u.motor.P_max_W / 1000.0)
+                    u.omega_nom * 60.0 / (2π), _p_kw, typeof(u.motor))
         end
         RotorFleet(_od)
     end
@@ -563,4 +622,73 @@ function preflight_da_warning(weight_N::Float64)
         @info "Reduced hover margin: T/W=$(round(tw,digits=3))  " *
               "($(round((tw-1)*100,digits=1))% above hover)"
     end
+end
+
+# ── Fleet Fuel Burn (saving callback) ──────────────────────────────────
+"""
+    fleet_fuel_burn!(kws, alt, dt_s, fleet) → (battery_kw_total, fuel_kg_burned)
+
+Per-rotor power source dispatch. Takes the per-rotor electrical power
+demand `kws` (kW, e.g. from `rotor_kw_each_bem` or `allocate_wrench_vx`)
+and routes each rotor's draw to its actual motor backend:
+
+  ElectricMotor          → added to `battery_kw_total` (battery/bus draw)
+  TurboshaftEngine       → `burn_fuel!` called on that rotor's engine;
+                            kg burned accumulated into `fuel_kg_burned`.
+                            NOT added to battery_kw_total (Mode 1 spec:
+                            turbine-electric rotors are battery-independent)
+  HybridTurbineElectric  → not yet wired (Mode 2/3, deferred)
+
+If two rotors share the same TurboshaftEngine instance (shared fuel tank,
+see FLEET override construction above), calling burn_fuel! once per rotor
+correctly depletes the shared tank.mass_kg by the sum of both rotors'
+demand, since each call mutates the same underlying FuelTank struct.
+
+Call from the saving callback only — never inside the ODE integrator.
+Mirrors the kws ordering from rotor_kw_each_bem / allocate_wrench_vx
+(NTuple{6,Float64}, kW, one entry per rotor id 1..6).
+"""
+function fleet_fuel_burn!(kws::NTuple{6,Float64}, alt::Float64, dt_s::Float64,
+                           fleet::RotorFleet = FLEET) :: Tuple{Float64,Float64}
+    battery_kw_total = 0.0
+    fuel_kg_burned    = 0.0
+
+    for i in 1:6
+        u  = fleet.units[i]
+        kw = max(kws[i], 0.0)   # negative (regen) kW not yet routed; see TODO below
+        if u.motor isa ElectricMotor
+            battery_kw_total += kw
+        elseif u.motor isa TurboshaftEngine
+            # NOTE: motor_power_available_W(TurboshaftEngine, ...) models ONLY
+            # the Gagg-Ferrar altitude lapse on P_sl_W — it has no concept of
+            # remaining fuel (by design; powerplant.jl keeps the power-ceiling
+            # function and the fuel tank orthogonal). Checking P_avail <= 0.0
+            # here would almost never catch fuel exhaustion — it only catches
+            # the (rare) case where altitude lapse alone has zeroed the
+            # ceiling. tank.mass_kg must be checked directly.
+            if u.motor.tank.mass_kg <= 0.0
+                # Tank dry — fall back to battery rather than losing thrust
+                # outright. AC-7 scenario.
+                battery_kw_total += kw
+            else
+                P_avail    = motor_power_available_W(u.motor, u.omega_nom * 60.0 / (2π), alt)
+                P_demand_W = kw * 1000.0
+                P_supplied = min(P_demand_W, P_avail)
+                fuel_kg_burned += burn_fuel!(u.motor, P_supplied, dt_s)
+                # If the engine ceiling (altitude lapse) couldn't meet full
+                # demand, the shortfall also falls back to battery so the
+                # rotor doesn't silently lose thrust at high density altitude.
+                shortfall_kw = max(P_demand_W - P_avail, 0.0) / 1000.0
+                battery_kw_total += shortfall_kw
+            end
+        elseif u.motor isa HybridTurbineElectric
+            # TODO(Phase 4/5): route through update_batt_soc! once Mode 2/3
+            # is implemented. For now treat as battery draw so the
+            # aggregate stays physically sane if someone enables this path
+            # early.
+            battery_kw_total += kw
+        end
+    end
+
+    return (battery_kw_total, fuel_kg_burned)
 end
