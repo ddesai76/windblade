@@ -518,7 +518,12 @@ function build_ode(du, u, p, t)
     thrust_cmd   = ifelse(!MANUAL && τ < 0.0,
                           thrust_held, thrust_cmd_ap)
     # Negative thrust_cmd = reverse rotors for braking (fw_descent)
-    _T_max = rotor_thrust_available(alt)
+    # FIX (2026-06-19): was rotor_thrust_available(alt), which is geometry-blind
+    # (always BG default = R=1.45, chord=0.096, ×6) and ignored any FLEET
+    # overrides from rotor_config.csv (mixed fleets, custom chord/solidity).
+    # fleet_thrust_available sums real per-rotor BEM thrust using each unit's
+    # actual blade_geom and its own RPM reference — see rotor_system.jl.
+    _T_max = fleet_thrust_available(alt)
     thrust_cmd = clamp(thrust_cmd, -0.5 * _T_max, _T_max)
     thrust_cmd, _vrs_f = vrs_gated_thrust(thrust_cmd, _VZ_CACHE[], alt)
     dthrust    = thrust_derivative(thrust_lag, thrust_cmd)
