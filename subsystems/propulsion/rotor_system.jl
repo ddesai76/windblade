@@ -560,27 +560,46 @@ function compute_da_correction()::Float64
 
     RP.da_correction = correction
 
-    # DA-corrected RPM: T ∝ ρ·n² at fixed kT → n ∝ 1/√ρ to maintain thrust
-    RP.bem_rpm_ref = 1250.0 / sqrt(max(correction, 0.1))
+    # FIX (2026-06-19): was blade_coefficients(rpm,0,rho_field) with no bg=,
+    # i.e. always the module-default BG (R=1.45, chord=0.096) × 6, regardless
+    # of FLEET overrides from rotor_config.csv. Mixed/custom fleets (different
+    # radius, chord, or rotor count per class) were silently invisible to this
+    # function. Now sums real per-rotor BEM thrust using each unit's own
+    # blade_geom AND its own SL-reference RPM (omega_nom, set from that
+    # rotor's rpm_hover in rotor_config.csv), each independently DA-scaled.
+    T_sl    = 0.0
+    T_field = 0.0
+    for u in FLEET.units
+        rpm_sl    = u.omega_nom * 60.0 / (2π)
+        rpm_field = rpm_sl / sqrt(max(correction, 0.1))   # T∝ρ·n² at fixed kT → n∝1/√ρ
+        T_sl    += blade_coefficients(rpm_sl,    0.0, RHO_SL;    bg = u.blade_geom).thrust_N
+        T_field += blade_coefficients(rpm_field, 0.0, rho_field; bg = u.blade_geom).thrust_N
+    end
+    RP.hover_thrust_N_sl = T_sl
+    RP.hover_thrust_N    = T_field
 
-    # BEM hover thrust at the DA-corrected RPM and field density.
-    # This is what the motor actually delivers — RPM scales up to compensate
-    # for lower ρ, so hover_thrust_N reflects real capability, not ρ-scaled SL.
-    bc = blade_coefficients(RP.bem_rpm_ref, 0.0, rho_field)
-    RP.hover_thrust_N_sl = bc.thrust_N * 6.0   # BEM value supersedes geometric default
-    RP.hover_thrust_N    = bc.thrust_N * 6.0   # effective at field — RPM already corrected
+    # Representative-only RPM for logging (fleet is no longer guaranteed
+    # uniform); not used in any thrust calc above.
+    RP.bem_rpm_ref = (FLEET.units[1].omega_nom * 60.0 / (2π)) / sqrt(max(correction, 0.1))
 
     @info "DA thrust correction: ρ=$(round(rho_field,digits=4)) kg/m³  " *
           "factor=$(round(correction,digits=4))  " *
-          "BEM rpm_ref=$(round(RP.bem_rpm_ref,digits=0)) RPM  " *
-          "hover_thrust=$(round(RP.hover_thrust_N,digits=0)) N"
+          "hover_thrust(SL)=$(round(RP.hover_thrust_N_sl,digits=0)) N  " *
+          "hover_thrust(field)=$(round(RP.hover_thrust_N,digits=0)) N"
     return correction
 end
 
 """
     rotor_thrust_available(alt_agl) → Float64 (N)
 
-Maximum aggregate thrust at altitude. Called per ODE step to clamp thrust_cmd.
+Maximum aggregate thrust at altitude, assuming a uniform 6-rotor fleet at
+the module-default BG geometry (R=1.45, chord=0.096) and a fixed 1250 RPM
+SL reference. Geometry-blind — does NOT reflect FLEET overrides.
+
+NOTE (2026-06-19): the live ODE thrust clamp in fly.jl now calls
+fleet_thrust_available() instead, which is FLEET-aware. This function is
+kept only as a quick uniform-fleet estimate / fallback; do not wire it
+back into the ODE path for a mixed or customized fleet.
 """
 function rotor_thrust_available(alt_agl::Real)::Float64
     ρ      = rho(alt_agl)
@@ -597,10 +616,17 @@ DA-corrected RPM computed individually per rotor radius.
 Use in place of rotor_thrust_available when FLEET has geometry overrides.
 """
 function fleet_thrust_available(alt_agl::Real, fleet::RotorFleet = FLEET)::Float64
-    ρ   = rho(alt_agl)
+    ρ          = rho(alt_agl)
+    correction = ρ / RHO_SL
     tot = 0.0
     for u in fleet.units
-        rpm = 1250.0 / sqrt(max(ρ / RHO_SL, 0.1))
+        # FIX (2026-06-19): was a single hardcoded "1250.0/√correction" applied
+        # to every rotor regardless of its own configured RPM — wrong for any
+        # rotor class whose rpm_hover differs from the legacy 1250 default
+        # (e.g. a higher-power turbine-electric class). Now scales each
+        # rotor's own SL-reference RPM (omega_nom, from rotor_config.csv).
+        rpm_sl  = u.omega_nom * 60.0 / (2π)
+        rpm     = rpm_sl / sqrt(max(correction, 0.1))
         bc  = blade_coefficients(rpm, 0.0, ρ; bg = u.blade_geom)
         tot += bc.thrust_N
     end
