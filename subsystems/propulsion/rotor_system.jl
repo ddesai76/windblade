@@ -1,7 +1,7 @@
 # rotor_system.jl:    Powerplant top-level model
 # AUTHOR:             DANIEL DESAI
-# UPDATED:            2026-06-17
-# VERSION:            0.1.2
+# UPDATED:            2026-06-19
+# VERSION:            0.1.3
 #
 # Motor swap patterns (all produce a valid RotorParams / RotorFleet):
 # ──────────────────────────────────────────────────────────────────────
@@ -691,4 +691,53 @@ function fleet_fuel_burn!(kws::NTuple{6,Float64}, alt::Float64, dt_s::Float64,
     end
 
     return (battery_kw_total, fuel_kg_burned)
+end
+
+# ── Fleet Fuel / Powerplant State (cockpit + CSV export) ───────────────
+"""
+    fleet_fuel_state(fleet=FLEET) → (fuel_kg, fuel_capacity_kg)
+
+Aggregate remaining fuel mass and total tank capacity across the fleet's
+*distinct* FuelTank instances. Rotors sharing one tank (see fuel_tank_id
+in the FLEET override loader above) are counted once, by object identity
+(`===`), not once per rotor — counting per-rotor would double- or
+sextuple-count a shared tank's mass_kg/capacity_kg. All-electric fleets
+(no TurboshaftEngine units) return (0.0, 0.0).
+
+Read-only — does not mutate tank state, safe to call every saving-callback
+step purely for display/CSV export. Call fleet_fuel_burn! first if you
+also need this step's actual burn to be reflected.
+"""
+function fleet_fuel_state(fleet::RotorFleet = FLEET)::Tuple{Float64,Float64}
+    tanks = FuelTank[]
+    for u in fleet.units
+        if u.motor isa TurboshaftEngine
+            tank = u.motor.tank
+            any(t -> t === tank, tanks) || push!(tanks, tank)
+        elseif u.motor isa HybridTurbineElectric
+            tank = u.motor.turbine.tank
+            any(t -> t === tank, tanks) || push!(tanks, tank)
+        end
+    end
+    isempty(tanks) && return (0.0, 0.0)
+    return (sum(t.mass_kg for t in tanks), sum(t.capacity_kg for t in tanks))
+end
+
+"""
+    fleet_powerplant_labels(fleet=FLEET) → NTuple{6,String}
+
+Per-rotor powerplant tag for cockpit/CSV export — "electric" or
+"turbine_electric", matching the rotor_config.csv / test_card.json
+override vocabulary exactly (see the FLEET override loader above).
+Derived from each unit's actual `motor` type rather than re-parsed from
+JSON, so it can never drift out of sync with what FLEET actually built.
+HybridTurbineElectric (Mode 2/3, not yet wired into fleet_fuel_burn!)
+reports as "turbine_electric" too, since it also burns fuel via its
+.turbine field and should still surface the cockpit fuel gauge.
+"""
+function fleet_powerplant_labels(fleet::RotorFleet = FLEET)::NTuple{6,String}
+    ntuple(6) do i
+        m = fleet.units[i].motor
+        (m isa TurboshaftEngine || m isa HybridTurbineElectric) ? "turbine_electric" : "electric"
+    end
 end
