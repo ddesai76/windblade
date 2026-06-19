@@ -154,7 +154,7 @@ Exit codes:
 | 2 | Build failed |
 | 3 | Sim failed / no CSV produced |
 | 4 | Flight planning failed |
-| 10 | Config payload invalid |
+| 10 | Config invalid |
 
 ## Rotor Configuration
 
