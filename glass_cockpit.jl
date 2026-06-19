@@ -1,23 +1,12 @@
-# glass_cockpit.jl:    Tiltrotor Sim Glass Cockpit MIL-STD-3009 NVG
+# glass_cockpit.jl:   eVTOL Tiltrotor Sim Glass Cockpit MIL-STD-3009 NVG
 # AUTHOR:              DANIEL DESAI
-# UPDATED:             2026-06-17
+# UPDATED:             2026-06-19
 # VERSION:             0.1.1
 #
 # GLMakie real-time instrument panel — NVG-compatible colour theme
 # per MIL-STD-3009 (Lighting, Aircraft, Night Vision Imaging System).
 #
 # MIL-STD-3009 colour requirements implemented:
-#   • NVIS White (u′=0.197, v′=0.453) for all cockpit text and symbology
-#     — mandated for new crew-station installs per §4.2.2; appears as a
-#     cool greenish-white to the naked eye
-#   • NVIS Green A (u′=0.214, v′=0.487) for primary instrument symbology
-#     and nominal/safe status readouts
-#   • NVIS Yellow (u′=0.260, v′=0.520) for caution signals per §4.2.5
-#   • NVIS Red (u′=0.400, v′=0.460) for warning signals per §4.2.5
-#   • Blue channel not suppressed globally — NVIS White has blue content
-#     by design; the standard filters energy above 625 nm (deep red/IR),
-#     not blue.  Class B filter cutoff: 665 nm.
-#   • B612 / B612-Bold throughout (Makie-bundled, no install needed)
 #
 # Layout (demo-ready, 1440 × 900 PFD + ~720 px NAV = ~2160 × 900):
 #   Columns: [Fixed 200 | auto | Fixed 200 | Fixed ~720 (NAV)]
@@ -135,28 +124,45 @@ const IDX = (
 )
 
 mutable struct CockpitState
-    vals          :: Vector{Float64}
-    phase         :: String
-    history_power :: Vector{Float64}
-    history_t     :: Vector{Float64}
-    rotor_rpm     :: Vector{Float64}
-    rotor_kw      :: Vector{Float64}
-    rotor_labels  :: Vector{String}
-    n_rotors      :: Int
-    gear_contact  :: Bool
-    strut_load_n  :: Float64
-    brakes_on     :: Bool       # true when wheel brakes are engaged
+    vals             :: Vector{Float64}
+    phase            :: String
+    history_power    :: Vector{Float64}
+    history_t        :: Vector{Float64}
+    rotor_rpm        :: Vector{Float64}
+    rotor_kw         :: Vector{Float64}
+    rotor_labels     :: Vector{String}
+    n_rotors         :: Int
+    gear_contact     :: Bool
+    strut_load_n     :: Float64
+    brakes_on        :: Bool       # true when wheel brakes are engaged
+    rotor_powerplant :: Vector{String}   # per-rotor: "electric" | "turboshaft" | "turbine_electric"
+    fuel_kg          :: Float64          # current fuel mass (turbine/hybrid fleets only)
+    fuel_capacity_kg :: Float64          # usable fuel capacity
 end
 
 function CockpitState(; n_rotors::Int=6,
-                        labels::Vector{String}=["R$i" for i in 1:6])
+                        labels::Vector{String}=["R$i" for i in 1:6],
+                        powerplants::Vector{String}=fill("electric", 6),
+                        fuel_kg::Float64=0.0,
+                        fuel_capacity_kg::Float64=0.0)
     CockpitState(zeros(22), "hover",   # 22 vals: +gx/gy/gz
                  Float64[], Float64[],
                  zeros(6), zeros(6),
                  vcat(labels, fill("", 6))[1:6],
                  clamp(n_rotors, 1, 6),
-                 false, 0.0, false)
+                 false, 0.0, false,
+                 vcat(powerplants, fill("electric", 6))[1:6],
+                 fuel_kg, fuel_capacity_kg)
 end
+
+# A rotor counts as turbine-powered if its powerplant string is
+# "turboshaft" or "turbine_electric" (hyphen/underscore/case-insensitive).
+# Pure "electric" rotors do not trigger the fuel gauge.
+const _TURBINE_POWERPLANTS = ("turboshaft", "turbine_electric", "turbine")
+_normalize_powerplant(pp::AbstractString) = replace(lowercase(strip(pp)), "-" => "_")
+has_turbine(s::CockpitState) =
+    any(_normalize_powerplant(pp) in _TURBINE_POWERPLANTS
+        for pp in s.rotor_powerplant[1:s.n_rotors])
 
 # ══════════════════════════════════════════════════════════════════════
 #  HELPER — thin panel border drawn inside any axis
@@ -597,8 +603,15 @@ function draw_contact!(ax, contact::Bool, strut_load_n::Float64,
           align=(:center, :center), font=LABEL_FONT)
 end
 
-# Power / SOC / Battery Temp panel
-function draw_power!(ax, power_kw, soc_pct, batt_temp_c)
+# Powerplant status panel — SOC, Battery Temp, and (turbine/turbine-electric
+# fleets only) Fuel. Aggregate power_kw is intentionally NOT shown here: it's
+# just the sum of the per-rotor kW values already displayed in the rotor
+# gauge strip below, so a 4th readout here would be redundant. The FUEL row
+# only appears when show_fuel is true (see has_turbine() in launch_cockpit);
+# all-electric fleets get the original 2-row panel with the third slot left
+# empty rather than a wasted standalone gauge/column.
+function draw_power!(ax, soc_pct, batt_temp_c, fuel_kg, fuel_capacity_kg;
+                     show_fuel::Bool=false)
     empty!(ax)
     hidedecorations!(ax)
     hidespines!(ax)
@@ -610,26 +623,36 @@ function draw_power!(ax, power_kw, soc_pct, batt_temp_c)
     soc_color  = soc_pct  > 40.0 ? TH.green : (soc_pct  > 20.0 ? TH.amber : TH.red)
     temp_color = batt_temp_c > 50.0 ? TH.amber : TH.text
 
-    text!(ax, 0.0,  0.82, text="POWER",
+    # Row 1 — SOC
+    text!(ax, 0.0,  0.82, text="SOC",
           fontsize=9, color=TH.text_label, align=(:center,:center), font=LABEL_FONT)
-    text!(ax, 0.0,  0.52, text=@sprintf("%.0f kW", power_kw),
-          fontsize=22, color=TH.text, align=(:center,:center), font=DISP_FONT)
+    text!(ax, 0.0,  0.52, text=@sprintf("%.0f%%", soc_pct),
+          fontsize=22, color=soc_color, align=(:center,:center), font=DISP_FONT)
 
     lines!(ax, [Point2f(-0.82, 0.30), Point2f(0.82, 0.30)],
            color=TH.stroke_hi, linewidth=0.8)
 
-    text!(ax, 0.0,  0.18, text="SOC",
+    # Row 2 — Battery temp
+    text!(ax, 0.0,  0.18, text="BATT TEMP",
           fontsize=9, color=TH.text_label, align=(:center,:center), font=LABEL_FONT)
-    text!(ax, 0.0, -0.10, text=@sprintf("%.0f%%", soc_pct),
-          fontsize=22, color=soc_color, align=(:center,:center), font=DISP_FONT)
-
-    lines!(ax, [Point2f(-0.82, -0.33), Point2f(0.82, -0.33)],
-           color=TH.stroke_hi, linewidth=0.8)
-
-    text!(ax, 0.0, -0.48, text="BATT TEMP",
-          fontsize=9, color=TH.text_label, align=(:center,:center), font=LABEL_FONT)
-    text!(ax, 0.0, -0.76, text=@sprintf("%.1f°C", batt_temp_c),
+    text!(ax, 0.0, -0.10, text=@sprintf("%.1f°C", batt_temp_c),
           fontsize=22, color=temp_color, align=(:center,:center), font=DISP_FONT)
+
+    # Row 3 — Fuel (only when at least one rotor is turbine-powered)
+    if show_fuel
+        lines!(ax, [Point2f(-0.82, -0.33), Point2f(0.82, -0.33)],
+               color=TH.stroke_hi, linewidth=0.8)
+
+        frac = fuel_capacity_kg > 0.0 ? clamp(fuel_kg / fuel_capacity_kg, 0.0, 1.0) : 0.0
+        fuel_color = frac > 0.40 ? TH.green : (frac > 0.15 ? TH.amber : TH.red)
+        low_fuel   = frac <= 0.15
+
+        text!(ax, 0.0, -0.48, text=low_fuel ? "FUEL — LOW" : "FUEL",
+              fontsize=9, color=low_fuel ? TH.red : TH.text_label,
+              align=(:center,:center), font=LABEL_FONT)
+        text!(ax, 0.0, -0.76, text=@sprintf("%.0f%%", frac * 100),
+              fontsize=22, color=fuel_color, align=(:center,:center), font=DISP_FONT)
+    end
 
     text!(ax, 0.0,  0.96, text="POWERPLANT",
           fontsize=8, color=TH.text_faint, align=(:center, :center), font=LABEL_FONT)
@@ -754,7 +777,7 @@ end
 #   6. Origin marker (green hollow circle)
 #   7. Waypoint marker (diamond, magenta=FLY-TO / green=RTB)
 #   8. Aircraft symbol (filled triangle rotated to heading)
-#   9. HUD overlay: bearing bug on a mini compass arc, XTE bar, data readout
+#   9. HUD overlay: bearing/range/AGL data readout (BRG/RNG/AGL strip)
 
 function draw_nav_map!(ax, snap)
     empty!(ax)
@@ -880,59 +903,11 @@ function draw_nav_map!(ax, snap)
     # Velocity vector stub (1 s × speed, scaled)
     # We don't have vx here, so omit — the track trail serves the purpose.
 
-    # ── HUD overlay: mini compass arc + XTE bar + data readout ────────
-    # Compass arc — top-left quadrant, radius 0.22 NDC
-    arc_cx = -0.72;  arc_cy = 0.77;  arc_r = 0.19
-    n_arc  = 48
-    arc_pts = [Point2f(arc_cx + arc_r * sin(a), arc_cy + arc_r * cos(a))
-               for a in range(-π/2, π/2, length=n_arc)]
-    lines!(ax, arc_pts, color=TH.stroke_hi, linewidth=1.0)
-
-    # Bearing bug on the arc (bearing to waypoint, relative to heading)
-    xte = nav_cross_track(ac_x, ac_y, hdg_rad, wx, wy)
+    # Bearing to waypoint — feeds the BRG readout below. The mini compass
+    # arc (heading bug) and XTE bar formerly here were removed: heading is
+    # already shown on the PFD heading tape, and cross-track error isn't a
+    # useful number for this mission profile.
     brg = nav_bearing(ac_x, ac_y, wx, wy)
-    rel_brg = mod(brg - hdg, 360.0)
-    if rel_brg > 180.0; rel_brg -= 360.0; end   # –180…+180
-    bug_angle_rad = clamp(deg2rad(rel_brg), -π/2, π/2)
-    bug_x = arc_cx + arc_r * sin(bug_angle_rad)
-    bug_y = arc_cy + arc_r * cos(bug_angle_rad)
-    scatter!(ax, [Point2f(bug_x, bug_y)],
-             color=wp_col, markersize=7, marker=:diamond)
-
-    # Heading label at centre of arc
-    text!(ax, arc_cx, arc_cy - 0.04,
-          text=@sprintf("%03d°", round(Int, mod(hdg, 360))),
-          fontsize=9, color=TH.text,
-          align=(:center, :center), font=DISP_FONT)
-
-    # ── XTE bar (horizontal, below compass arc) ───────────────────────
-    xte_bar_y  = arc_cy - 0.15
-    xte_bar_hw = 0.17                  # half-width in NDC
-    xte_max    = radius * 0.25         # full-deflection cross-track (m)
-    xte_frac   = clamp(xte / xte_max, -1.0, 1.0)
-    xte_col    = abs(xte_frac) > 0.70 ? TH.red :
-                 abs(xte_frac) > 0.40 ? TH.amber : TH.green
-
-    # Track bar
-    lines!(ax, [Point2f(arc_cx - xte_bar_hw, xte_bar_y),
-                Point2f(arc_cx + xte_bar_hw, xte_bar_y)],
-           color=TH.stroke_hi, linewidth=1.2)
-    # Centre tick
-    lines!(ax, [Point2f(arc_cx, xte_bar_y - 0.015),
-                Point2f(arc_cx, xte_bar_y + 0.015)],
-           color=TH.text_dim, linewidth=0.8)
-    # Needle
-    needle_x = arc_cx + xte_frac * xte_bar_hw
-    lines!(ax, [Point2f(needle_x, xte_bar_y - 0.022),
-                Point2f(needle_x, xte_bar_y + 0.022)],
-           color=xte_col, linewidth=2.0)
-
-    # XTE label
-    xte_str = abs(xte) < 10.0 ? "XTE 0" :
-              @sprintf("XTE %+.0f m", xte)
-    text!(ax, arc_cx, xte_bar_y - 0.04,
-          text=xte_str, fontsize=7, color=xte_col,
-          align=(:center, :center), font=LABEL_FONT)
 
     # ── Data readout strip (bottom of panel) ──────────────────────────
     # RNG: large display.  AGL: very large, phase-gated colour coding.
@@ -1004,18 +979,27 @@ Launch the MIL-STD-3009 NVG-compatible cockpit window.
 
 Pass `nav_map::NavMapState` (from navigation.jl) to enable the moving-map
 panel in column 4.  Omit or pass `nothing` for the original 3-column PFD.
+
+The POWERPLANT panel (fig[4,1]) shows a FUEL row below SOC/BATT TEMP
+automatically — and only — when `state_obs[]` reports at least one
+turbine-powered rotor via `has_turbine()`.  All-electric fleets get the
+original 2-row panel. Powerplant mix is treated as a fixed aircraft
+configuration, so this is decided once at launch from the initial state,
+not re-evaluated per frame.
 """
 function launch_cockpit(state_obs::Observable{CockpitState};
                         rpm_nom::Float64=1050.0,
                         kw_max_per_rotor::Float64=80.0,
                         nav_map=nothing)
 
-    has_map = nav_map !== nothing
+    has_map   = nav_map !== nothing
+    show_fuel = has_turbine(state_obs[])
     # PFD columns (1-3): 200 + auto + 200 ≈ 960 px at 1440 total.
     # NAV panel target: ~1/3 of total → total ≈ 1440 * 1.5 ≈ 2160 when present.
     # We fix the NAV column width so NAV/(PFD+NAV) ≈ 1/3.
     # nav_col_w ≈ 0.5 * PFD_width.  PFD_width ≈ 1440. → nav_col_w ≈ 720.
     # Resulting total ≈ 2160 px (16:10 works fine at 2160×900).
+    col_w   = 200   # declared early — also used below for cols 1/3
     fig_w   = has_map ? 2160 : 1440
 
     fig = Figure(size=(fig_w, 900), backgroundcolor=TH.bg,
@@ -1054,11 +1038,10 @@ function launch_cockpit(state_obs::Observable{CockpitState};
 
     # ── Shared column grid ────────────────────────────────────────────
     # All rows live directly in fig.layout so column edges are identical.
-    # Column widths are set once here:
+    # Column widths are set once here (col_w declared above, used for fig_w):
     #   col 1 — left panel  (speed tape / power)   Fixed(200)
     #   col 2 — centre      (ADI + heading / rotors)  Relative(1)
     #   col 3 — right panel (alt tape / tilt)      Fixed(200)
-    col_w = 200   # single source of truth for left/right column width (VCON/power, CONTACT/tilt)
 
     # ══════════════════════════════════════════════════════════════════
     #  REVISED LAYOUT — HUD tapes via nested GridLayout
@@ -1103,7 +1086,7 @@ function launch_cockpit(state_obs::Observable{CockpitState};
     ax_hdg     = Axis(fig[3, 2], backgroundcolor=TH.panel)
     ax_contact = Axis(fig[3, 3], backgroundcolor=TH.panel)
 
-    # ── Row 4: Power | Rotor gauges × 6 | Tilt ───────────────────────
+    # ── Row 4: Power(+Fuel) | Rotor gauges × 6 | Tilt ────────────────
     ax_power = Axis(fig[4, 1], backgroundcolor=TH.bg)
     ax_tilt  = Axis(fig[4, 3], backgroundcolor=TH.bg)
 
@@ -1158,7 +1141,8 @@ function launch_cockpit(state_obs::Observable{CockpitState};
                       s.brakes_on, v[IDX.gz])
 
         # Bottom row
-        draw_power!(ax_power, v[IDX.power], v[IDX.soc], v[IDX.batt_temp])
+        draw_power!(ax_power, v[IDX.soc], v[IDX.batt_temp],
+                    s.fuel_kg, s.fuel_capacity_kg; show_fuel=show_fuel)
         draw_rotor_gauges!(ax_rotors, s.rotor_rpm, s.rotor_kw,
                            s.rotor_labels, s.n_rotors,
                            rpm_nom, kw_max_per_rotor)
@@ -1191,7 +1175,23 @@ function playback_csv(path::String; fps=10.0, nav_map=nothing)
     println("Loaded $(nrow(df)) rows from $path")
     println("Playing back at $(fps)x realtime … [NVG MODE]")
 
-    state = CockpitState()
+    # Per-rotor powerplant is a fixed aircraft config, not per-row telemetry —
+    # read it once from row 1 if the columns exist (e.g. "powerplant_r1" ..
+    # "powerplant_r6", written by rotor_config.csv-aware export paths).
+    # Absent columns default to "electric", matching the original all-electric
+    # behaviour (no fuel gauge) for legacy CSVs.
+    powerplants = if nrow(df) > 0
+        [hasproperty(df, Symbol("powerplant_r$i")) ?
+            String(df[1, Symbol("powerplant_r$i")]) : "electric"
+         for i in 1:6]
+    else
+        fill("electric", 6)
+    end
+    fuel_capacity_kg = (nrow(df) > 0 && hasproperty(df, :fuel_capacity_kg)) ?
+        Float64(df[1, :fuel_capacity_kg]) : 0.0
+
+    state = CockpitState(powerplants=powerplants, fuel_capacity_kg=fuel_capacity_kg,
+                          fuel_kg=fuel_capacity_kg)
     obs   = Observable(state)
     fig   = launch_cockpit(obs; nav_map=nav_map)
 
@@ -1234,6 +1234,7 @@ function playback_csv(path::String; fps=10.0, nav_map=nothing)
         state.gear_contact         = hasproperty(row, :gear_contact)  ? Bool(row.gear_contact)  : false
         state.strut_load_n         = hasproperty(row, :strut_load_n)  ? Float64(row.strut_load_n) : 0.0
         state.phase                = row.phase
+        state.fuel_kg              = hasproperty(row, :fuel_kg) ? Float64(row.fuel_kg) : state.fuel_capacity_kg
 
         for i in 1:6
             state.rotor_rpm[i] = getproperty(row, Symbol("rpm_r$i"))
