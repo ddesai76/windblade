@@ -1,7 +1,7 @@
-# fly.jl:         eVTOL Tiltrotor Simulation
+# fly.jl:         Advanced Air Mobility Tiltrotor Simulation
 # AUTHOR:         DANIEL DESAI
-# UPDATED:        2026-05-10
-# VERSION:        0.1.0
+# UPDATED:        2026-06-19
+# VERSION:        0.1.1
 #
 # Single entry point: loads subsystems, runs physics model, streams to glass_cockpit.jl
 #
@@ -198,6 +198,11 @@ agl_m_to_msl_ft(alt_agl_m) = (alt_agl_m + ATM.airport_alt_m) * M_TO_FT
 
 # ── Rotor fleet labels ────────────────────────────────────────────────
 const _ROTOR_LABELS = [FLEET.units[i].label for i in 1:6]
+# Per-rotor powerplant tag ("electric" | "turbine_electric") for cockpit
+# fuel-gauge gating and CSV export — see fleet_powerplant_labels() in
+# rotor_system.jl. Static for the run (FLEET's motor mix doesn't change
+# mid-flight), so computed once here rather than per saving-callback step.
+const _ROTOR_POWERPLANT_LABELS = fleet_powerplant_labels(FLEET)
 
 # ══════════════════════════════════════════════════════════════════════
 #  ControlOutput — shared interface between autopilot.so and HOTAS path
@@ -673,8 +678,16 @@ end
 # ══════════════════════════════════════════════════════════════════════
 #  SHARED STATE (GUI ↔ solver)
 # ══════════════════════════════════════════════════════════════════════
+# fleet_fuel_state() here reads FLEET's tanks before any burn has happened,
+# so this is the as-loaded fuel mass (FuelTank's initial_L, not necessarily
+# full capacity) — the correct starting point for the cockpit fuel gauge.
+# (Kept as a single tuple const, not `const a, b = ...` destructuring —
+# `const` does not support multi-target tuple assignment in Julia.)
+const _INIT_FUEL = fleet_fuel_state()   # (fuel_kg, fuel_capacity_kg)
 const _cockpit_state = SHOW_GUI ?
-    CockpitState(n_rotors=6, labels=_ROTOR_LABELS) : nothing
+    CockpitState(n_rotors=6, labels=_ROTOR_LABELS,
+                 powerplants=collect(_ROTOR_POWERPLANT_LABELS),
+                 fuel_kg=_INIT_FUEL[1], fuel_capacity_kg=_INIT_FUEL[2]) : nothing
 const _state_obs     = SHOW_GUI ? Observable(_cockpit_state) : nothing
 const _csv_io = Ref{Union{IOStream,Nothing}}(nothing)
 const _HIST_MAX      = 600
@@ -693,14 +706,16 @@ function start_csv_writer(path::String)
         "gear_contact,strut_load_n," *
         "rpm_r1,rpm_r2,rpm_r3,rpm_r4,rpm_r5,rpm_r6," *
         "kw_r1,kw_r2,kw_r3,kw_r4,kw_r5,kw_r6," *
-        "q0,q1,q2,q3")
+        "q0,q1,q2,q3," *
+        "powerplant_r1,powerplant_r2,powerplant_r3,powerplant_r4,powerplant_r5,powerplant_r6," *
+        "fuel_kg,fuel_capacity_kg")
     _csv_io[] = f
 end
 
 function write_csv_row(row)
     f = _csv_io[]
     f === nothing && return
-    @printf(f, "%.2f,%.2f,%s,%.2f,%.1f,%.1f,%.3f,%.1f,%.2f,%.1f,%.1f,%.1f,%.1f,%.2f,%.1f,%.4f,%.4f,%.4f,%.3f,%.3f,%.3f,%.4f,%.4f,%.4f,%d,%.1f,%.0f,%.0f,%.0f,%.0f,%.0f,%.0f,%.1f,%.1f,%.1f,%.1f,%.1f,%.1f,%.6f,%.6f,%.6f,%.6f\n",
+    @printf(f, "%.2f,%.2f,%s,%.2f,%.1f,%.1f,%.3f,%.1f,%.2f,%.1f,%.1f,%.1f,%.1f,%.2f,%.1f,%.4f,%.4f,%.4f,%.3f,%.3f,%.3f,%.4f,%.4f,%.4f,%d,%.1f,%.0f,%.0f,%.0f,%.0f,%.0f,%.0f,%.1f,%.1f,%.1f,%.1f,%.1f,%.1f,%.6f,%.6f,%.6f,%.6f,%s,%s,%s,%s,%s,%s,%.3f,%.3f\n",
         row.t, row.tau, row.phase, row.speed, row.alt_msl_ft, row.power, row.vrs_factor,
         row.tilt,
         row.soc, row.voltage, row.batt_temp,
@@ -713,7 +728,10 @@ function write_csv_row(row)
         row.rpm[4], row.rpm[5], row.rpm[6],
         row.kw[1],  row.kw[2],  row.kw[3],
         row.kw[4],  row.kw[5],  row.kw[6],
-        row.q0, row.q1, row.q2, row.q3)
+        row.q0, row.q1, row.q2, row.q3,
+        row.powerplant[1], row.powerplant[2], row.powerplant[3],
+        row.powerplant[4], row.powerplant[5], row.powerplant[6],
+        row.fuel_kg, row.fuel_capacity_kg)
     flush(f)
 end
 
@@ -880,6 +898,19 @@ function make_saving_cb(rt_factor::Float64, dt_ref::Ref{Float64})
                 power_kw  = sum(kw_each)
             end
             BEM_POWER_KW_CACHE[] = power_kw
+
+            # ── Fuel burn (turbine/turbine-electric rotors only) ───────
+            # No-op for all-electric fleets — fleet_fuel_burn! routes every
+            # ElectricMotor rotor's kw to battery_kw_total (unused below;
+            # battery draw is still computed from power_kw via
+            # battery_current() as before — see TODO in fleet_fuel_burn!'s
+            # docstring re: wiring battery_kw_total through that path).
+            # fleet_fuel_state reads back FLEET's tank(s) immediately after,
+            # so fuel_kg/fuel_capacity_kg below always reflect this step's
+            # burn, not last step's.
+            _battery_kw_routed, _fuel_kg_burned_step = fleet_fuel_burn!(kw_each, Float64(alt), cb_dt)
+            fuel_kg, fuel_capacity_kg = fleet_fuel_state()
+
             current_a = battery_current(power_kw)
             voltage_v = terminal_voltage(soc, current_a)
             batt_temp = steady_state_temp(power_kw)
@@ -941,7 +972,9 @@ function make_saving_cb(rt_factor::Float64, dt_ref::Ref{Float64})
                 gx=gx, gy=gy, gz=gz,
                 turb_u=Float64(u[20]), turb_v=Float64(u[21]), turb_w=Float64(u[22]),
                 gear_contact=gear_on, strut_load_n=strut_n,
-                rpm=rpm_each .* (60.0 / 2π), kw=kw_each))
+                rpm=rpm_each .* (60.0 / 2π), kw=kw_each,
+                powerplant=_ROTOR_POWERPLANT_LABELS,
+                fuel_kg=fuel_kg, fuel_capacity_kg=fuel_capacity_kg))
 
             if SHOW_GUI
                 s = _cockpit_state
@@ -970,6 +1003,7 @@ function make_saving_cb(rt_factor::Float64, dt_ref::Ref{Float64})
                 s.vals[IDX.gy]       = gy
                 s.vals[IDX.gz]       = gz
                 s.phase              = phase
+                s.fuel_kg            = fuel_kg
                 for i in 1:6
                     s.rotor_rpm[i] = rpm_each[i] * (60.0 / 2π)
                     s.rotor_kw[i]  = kw_each[i]
@@ -1139,6 +1173,7 @@ function main()
             _cr_l=cos(Float64(roll_l)/2); _sr_l=sin(Float64(roll_l)/2)
             _cp_l=cos(Float64(pitch_l)/2); _sp_l=sin(Float64(pitch_l)/2)
             _cy_l=cos(Float64(yaw_l)/2);  _sy_l=sin(Float64(yaw_l)/2)
+            _fuel_kg_l, _fuel_cap_l = fleet_fuel_state()
             write_csv_row((
                 t=t_l, tau=τ_l, phase="landed", speed=vx_l*3.6,
                 alt_msl_ft=agl_m_to_msl_ft(alt_l), power=0.0, vrs_factor=1.0,
@@ -1154,11 +1189,14 @@ function main()
                 gx=0.0, gy=0.0, gz=strut_l/(AP.mass_kg*9.80665),
                 turb_u=Float64(u[20]), turb_v=Float64(u[21]), turb_w=Float64(u[22]),
                 gear_contact=true, strut_load_n=strut_l,
-                rpm=ntuple(_->0.0, 6), kw=ntuple(_->0.0, 6)))
+                rpm=ntuple(_->0.0, 6), kw=ntuple(_->0.0, 6),
+                powerplant=_ROTOR_POWERPLANT_LABELS,
+                fuel_kg=_fuel_kg_l, fuel_capacity_kg=_fuel_cap_l))
             if SHOW_GUI
                 s = _cockpit_state
                 s.gear_contact = true; s.strut_load_n = strut_l
-                s.phase = "landed"; _state_obs[].vals[1] = t_l
+                s.phase = "landed"; s.fuel_kg = _fuel_kg_l
+                _state_obs[].vals[1] = t_l
             end
             terminate!(integrator)
         end, nothing)
