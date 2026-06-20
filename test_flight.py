@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 #
-# <fly.jl>:   <Unified flight test runner>
-# <Author>:   <DANIEL DESAI>
-# <Updated>:  <2026-06-15>
-# <Version>:  <0.1.1>
+# <test_flight.py>:     Unified flight test runner>
+# Author:               DANIEL DESAI>
+# Updated:              2026-06-20
+# Version:              0.1.2
 
 """
 Usage:
@@ -274,15 +274,23 @@ _ROTOR_CSV = ROOT / "subsystems" / "propulsion" / "rotor_config.csv"
 # S4-class baseline — rows that match these values exactly are not emitted
 # as overrides (keeps test_card.json clean for the all-default case).
 _S4_DEFAULTS = {
-    "R_m": 1.524, "n_blades": 3, "chord_m": 0.12,
+    "R_m": 1.45, "n_blades": 5, "chord_m": 0.096,
     "twist_root_deg": 16.0, "twist_tip_deg": 6.0,
-    "pitch_offset_deg": 4.4, "P_max_kW": 280, "rpm_hover": 1250,
+    "pitch_offset_deg": 4.4, "P_max_kW": 236, "rpm_hover": 1284,
 }
+
+_S4_POWERPLANT = "electric"  # baseline for override-suppression logic
 
 def _rotor_fleet_overrides() -> dict:
     """Read rotor_config.csv and return a rotor_fleet dict with per-rotor
-    overrides for any rotor whose geometry or motor differs from S4 defaults.
-    Rows that are all-default produce no entry (compact JSON for stock builds).
+    overrides for any rotor whose geometry or powerplant differs from S4
+    defaults.  Rows that are all-default produce no entry (compact JSON for
+    stock builds).
+
+    powerplant is a string field ("electric" | "turboshaft" |
+    "turbine-electric") and is always written into the entry when it differs
+    from the S4 baseline ("electric"), so rotor_system.jl can branch on it to
+    construct the correct powerplant struct.
     """
     overrides = []
     if not _ROTOR_CSV.exists():
@@ -301,7 +309,6 @@ def _rotor_fleet_overrides() -> dict:
                     raw = row.get(field)
                     if raw is None:
                         continue
-                    val = float(raw) if "." in raw or field not in ("n_blades", "rpm_hover") else int(raw)
                     if isinstance(default, int):
                         val = int(round(float(raw)))
                     else:
@@ -309,6 +316,11 @@ def _rotor_fleet_overrides() -> dict:
                     if abs(val - default) > 1e-9:
                         changed = True
                     entry[field] = val
+                # powerplant — string field, compared separately
+                powerplant = row.get("powerplant", "").strip() or _S4_POWERPLANT
+                entry["powerplant"] = powerplant
+                if powerplant != _S4_POWERPLANT:
+                    changed = True
                 # Always include notes if present
                 entry["notes"] = row.get("notes", "")
                 if changed:
@@ -711,9 +723,10 @@ def run_simulation(gui: bool, manual: bool,
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Stage 4 — Analysis (inline: plots + test checks + HTML report)
+# Stage 4 — Analysis (test checks + HTML report)
 # Replaces the former subprocess calls to plot_results.py and test_executive.py,
-# both of which are now defunct.
+# both of which are now defunct. Plotting itself now lives in plot_test_flight.py
+# — run it separately against the resulting CSV.
 # ══════════════════════════════════════════════════════════════════════════════
 
 # ── Check limits (edit here) ──────────────────────────────────────────────────
@@ -726,95 +739,6 @@ GZ_NORMAL_LIMIT  = 1.5     # g
 GZ_EMERGENCY_LIM = 2.5     # g
 
 RPM_COLS = [f"rpm_r{i}" for i in range(1, 7)]
-
-# ── Plot helpers ──────────────────────────────────────────────────────────────
-
-PHASE_COLORS = {
-    "hover": "#02CCFE", "transition": "#ffaa00", "fw_climb": "#44cc66",
-    "dash": "#87CEEB", "fw_descent": "#ee44aa", "back_transition": "#ffaa00",
-    "descent": "#02CCFE", "landed": "#44cc66",
-}
-_BG    = (0.06, 0.06, 0.10)
-_PANEL = (0.10, 0.10, 0.16)
-_GRID  = (1.0, 1.0, 1.0, 0.07)
-_TICK  = (0.55, 0.55, 0.65)
-_LABEL = (0.85, 0.85, 0.95)
-_TITLE = (0.95, 0.95, 1.00)
-
-def _pc(p): return PHASE_COLORS.get(p, "#ffffff")
-
-def _dark(ax):
-    ax.set_facecolor(_PANEL)
-    ax.tick_params(colors=_TICK, labelsize=9)
-    ax.xaxis.label.set_color(_LABEL); ax.yaxis.label.set_color(_LABEL)
-    ax.title.set_color(_TITLE); ax.title.set_fontsize(13)
-    ax.xaxis.label.set_fontsize(11); ax.yaxis.label.set_fontsize(11)
-    for s in ax.spines.values(): s.set_visible(False)
-    ax.grid(True, color=_GRID, linewidth=0.8, linestyle=(0, (1, 3)))
-
-def _legend_handles():
-    import matplotlib.lines as mlines
-    return [mlines.Line2D([], [], color=_pc(k), linewidth=5, label=lbl) for k, lbl in [
-        ("hover", "hover & descent"), ("transition", "transition 1 & 2"),
-        ("fw_climb", "fw climb"), ("dash", "dash"), ("fw_descent", "fw descent"),
-    ]]
-
-def _fill_axes(ax_spd, ax_alt, ax_pwr, ax_trk, data, redline=2000.0):
-    phases = list(PHASE_COLORS.keys())
-    for ph in phases:
-        mask = data["phase"] == ph
-        if not mask.any(): continue
-        ax_spd.plot(data.loc[mask,"timestamp_s"], data.loc[mask,"speed_kmh"],      color=_pc(ph), lw=2.7)
-        ax_alt.plot(data.loc[mask,"timestamp_s"], data.loc[mask,"altitude_msl_ft"],color=_pc(ph), lw=2.7)
-        ax_trk.plot(data.loc[mask,"y_m"],         data.loc[mask,"x_m"],             color=_pc(ph), lw=2.7)
-    for ax, title, xl, yl in [
-        (ax_spd,"Speed","Time (s)","Speed (km/h)"),
-        (ax_alt,"Altitude","Time (s)","Altitude (ft MSL)"),
-    ]:
-        ax.set_title(title); ax.set_xlabel(xl); ax.set_ylabel(yl); _dark(ax)
-    ax_pwr.set_title("Power"); ax_pwr.set_xlabel("Time (s)"); ax_pwr.set_ylabel("Power (kW)"); _dark(ax_pwr)
-    ax_pwr.axhline(redline, color=(1,0,0,0.5), lw=1.5, linestyle="--")
-    ts, pw = data["timestamp_s"].values, data["power_kw"].values
-    for i in range(len(ts)-1):
-        ax_pwr.plot(ts[i:i+2], pw[i:i+2], color="#ff2222" if pw[i]>redline else "#ffffff", lw=2.7)
-    ax_trk.set_title("Ground Track"); ax_trk.set_xlabel("y from takeoff (m)"); ax_trk.set_ylabel("x from takeoff (m)")
-    _dark(ax_trk); ax_trk.set_aspect("equal", adjustable="datalim")
-    ax_trk.scatter([0],[0], color="#44cc66", s=60, zorder=5, marker="o", edgecolors="#ffffff", lw=0.8)
-    ax_trk.annotate("  TKOF", xy=(0,0), fontsize=9, color=_LABEL, xytext=(4,4), textcoords="offset points")
-    contact = data[data["gear_contact"]==1]
-    if len(contact):
-        lx, ly = contact["x_m"].iloc[0], contact["y_m"].iloc[0]
-        ax_trk.scatter([ly],[lx], color="#ff4444", s=80, zorder=5, marker="X", edgecolors="#ffffff", lw=0.8)
-        ax_trk.annotate(f"  LAND\n  [{lx:.0f}, {ly:.0f}] m", xy=(ly,lx), fontsize=9, color=_LABEL, xytext=(8,4), textcoords="offset points")
-
-def _make_fig(title):
-    import matplotlib.pyplot as plt
-    fig, axes = plt.subplots(2, 2, figsize=(18,10), facecolor=_BG)
-    fig.subplots_adjust(left=0.06, right=0.84, top=0.88, bottom=0.09, wspace=0.28, hspace=0.38)
-    fig.suptitle(title, fontsize=20, fontweight="bold", color=_TITLE, y=0.97)
-    fig.legend(handles=_legend_handles(), loc="center right", bbox_to_anchor=(0.995,0.50),
-               frameon=True, framealpha=0.08, facecolor=_PANEL, edgecolor=(1,1,1,0.08),
-               labelcolor=_LABEL, fontsize=13, handlelength=2.2, handleheight=0.4,
-               labelspacing=0.75, borderpad=0.8)
-    return fig, axes
-
-def generate_plots(df, out_dir: Path) -> list:
-    import matplotlib
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
-    written = []
-    for title, slicer, suffix in [
-        ("Flight Profile",       lambda d: d,                                                    ""),
-        ("Takeoff  (first 30s)", lambda d: d[d["timestamp_s"] <= d["timestamp_s"].min() + 30], "_tkof"),
-        ("Landing  (last 90s)",  lambda d: d[d["timestamp_s"] >= d["timestamp_s"].max() - 90], "_land"),
-    ]:
-        fig, axes = _make_fig(title)
-        _fill_axes(axes[0,0], axes[0,1], axes[1,0], axes[1,1], slicer(df))
-        p = out_dir / f"dash_results{suffix}.png"
-        fig.savefig(p, dpi=200, bbox_inches="tight", facecolor=_BG)
-        plt.close(); written.append(p)
-        success(f"Plot: {p.name}")
-    return written
 
 # ── Check helpers ─────────────────────────────────────────────────────────────
 
@@ -977,19 +901,13 @@ def run_analysis(csv_path: Path, card_path: Path, out_dir: Path) -> int:
     try:
         import pandas as pd
     except ImportError:
-        warn("pandas not installed — skipping analysis. pip install pandas matplotlib numpy")
+        warn("pandas not installed — skipping analysis. pip install pandas numpy")
         return 0
 
     df = pd.read_csv(csv_path, skipinitialspace=True)
     df.columns = df.columns.str.strip()
     df["phase"] = df["phase"].str.strip().str.lower().str.replace(r"^autoland:", "", regex=True)
     tc = json.loads(card_path.read_text()) if card_path.exists() else {}
-
-    # ── Plots ─────────────────────────────────────────────────────────
-    try:
-        generate_plots(df, out_dir)
-    except Exception as e:
-        warn(f"Plotting failed: {e}")
 
     # ── Checks ────────────────────────────────────────────────────────
     checks = [
@@ -1228,7 +1146,7 @@ def main():
     p.add_argument("--no-build", action="store_true",
                    help="Reuse existing .so files; skip C++ compilation.")
     p.add_argument("--out",      default=str(ROOT), metavar="DIR",
-                   help="Output directory for CSV, plots, and HTML report.")
+                   help="Output directory for CSV and HTML report.")
     p.add_argument("--csv",      default=None, metavar="PATH",
                    help="Skip simulation; analyse an existing CSV directly.")
     p.add_argument("--db",       action="store_true",
@@ -1365,17 +1283,6 @@ def main():
             exit_code = run_analysis(csv_path, card_path, out_dir)
         except Exception as e:
             warn(f"Analysis error: {e}")
-
-        # matplotlib (Agg) can leave background processes alive that block
-        # a normal interpreter shutdown — that is why main() ends with
-        # os._exit rather than sys.exit.  Closing all figures explicitly
-        # here ensures the PNGs are fully flushed before os._exit fires;
-        # without this a premature Ctrl+C loses the .png and .db files.
-        try:
-            import matplotlib.pyplot as _plt
-            _plt.close("all")
-        except Exception:
-            pass
 
         if args.db:
             try:
