@@ -1,7 +1,7 @@
-// autopilot.cpp:   eVTOL tiltrotor autopilot shared library
+// autopilot.cpp:   Autopilot shared library
 // AUTHOR:          DANIEL DESAI
-// UPDATED:         2026-05-10
-// VERSION:         0.1.0
+// UPDATED:         2026-06-21
+// VERSION:         0.1.1
 //
 // Compile:
 //   g++ -O2 -std=c++17 -fPIC -shared -o controls/autopilot.so controls/autopilot.cpp
@@ -36,6 +36,12 @@
 //  15  omega_x   body roll rate (rad/s)
 //  16  omega_y   body pitch rate (rad/s)
 //  17  omega_z   body yaw rate (rad/s)
+//
+// Appended extras (not part of the core 18-state ODE vector, added by the
+// saving callback in fly.jl when present):
+//  18  terrain AGL (m) — height above local terrain, present when n>=19
+//  19  vz          vertical speed (m/s, +climbing) — from fly.jl's
+//                  _VZ_CACHE (previous step's dalt), present when n>=20
 
 #include <cmath>
 #include <cstdbool>
@@ -91,6 +97,8 @@ typedef struct {
     double target_hover_alt_m; // hover_alt_m + z_m: hover ref at destination in ODE frame
     double dash_altitude_m;
     double dash_speed_ms;       // TC.dash_speed_kmh / 3.6
+    double descent_rate_fw_ms;  // TC.descent_rate_fw_ms — sink-rate target above hover_alt_m AGL
+    double land_descent_rate_ms;// TC.land_descent_rate_ms — sink-rate target inside hover_alt_m AGL
 
     // Envelope limits
     double soc_min;
@@ -110,10 +118,11 @@ static bool s_descent_armed = false;
 // ── PI integral accumulators ─────────────────────────────────────────────
 // Persistent across AP calls within one simulation run.
 // reset_pi_state() is called by reset_autopilot_state() so mission restart
-// is always clean. Three channels, one accumulator each.
+// is always clean. Four channels, one accumulator each.
 static double I_hover_alt  = 0.0;   // (m)·s   — hover altitude integral
 static double I_dash_speed = 0.0;   // (m/s)·s — cruise speed integral
 static double I_btrans_vel = 0.0;   // (m/s)·s — back-transition vx integral
+static double I_descent_vz = 0.0;   // (m/s)·s — descent sink-rate integral
 
 // ── FLARE persistent state ────────────────────────────────────────────────
 static double s_flare_agl_prev = -1.0;
@@ -124,6 +133,7 @@ extern "C" void reset_pi_state() {
     I_hover_alt  = 0.0;
     I_dash_speed = 0.0;
     I_btrans_vel = 0.0;
+    I_descent_vz = 0.0;
 }
 
 extern "C" void reset_autopilot_state() {
@@ -143,6 +153,13 @@ extern "C" void reset_autopilot_state() {
 //                   watch power_kw doesn't rail at max_thrust_N.
 //   Ki_btrans     : MUST be gated strictly to BACK_TRANSITION phase.
 //                   Any leak into DESCENT causes oscillatory flare.
+//   Kp/Ki_descent_vz : UNTUNED — starter values only, picked conservative
+//                   to avoid oscillation rather than from any measured
+//                   response. Validate: grep DESCENT *.csv, compute vz from
+//                   d(alt_agl_m)/dt, check it converges to -descent_rate_fw_ms
+//                   (then -land_descent_rate_ms inside hover_alt_m AGL)
+//                   without overshoot; raise Kp first, then Ki if there's a
+//                   persistent steady-state offset.
 //
 // Anti-windup: hard clamp on accumulator = I_xxx_max / Ki_xxx.
 // That gives a maximum PI contribution = I_xxx_max regardless of Ki.
@@ -161,6 +178,11 @@ struct PIGains {
     double Kp_btrans     = 0.05;    // existing P on vx (pitch_target per m/s)
     double Ki_btrans     = 0.10;    // integral — gate strictly; reset on exit
     double I_btrans_max  = 0.20;    // fraction of weight — anti-windup ceiling
+
+    // Channel 4: Descent sink rate (vz) — untuned starter values, see above
+    double Kp_descent_vz = 0.08;    // weight fraction per (m/s) error
+    double Ki_descent_vz = 0.04;    // integral
+    double I_descent_max = 0.16;    // fraction of weight — anti-windup ceiling
 } PIG;
 
 // ── dt estimation from autopilot timestamp ────────────────────────────────
@@ -249,16 +271,18 @@ static Phase get_phase(const double* s, int n, const APConfig* cfg) {
     if (!s_descent_armed) s_descent_armed = true;  // force arm by range
 
     // Sub-phases after descent is armed:
-    // fw_descent:      vx > 25 m/s — thrust cut, decelerate and descend
-    // back_transition: vx <= 25 m/s and above destination hover band
-    // descent:         within hover band of destination — translate + sink
+    // fw_descent:      vx > 25 m/s — nacelles held at cruise, thrust cut,
+    //                  decelerate and descend toward VCON/transition speed
+    // back_transition: vx <= 25 m/s and nacelles still rotating toward hover
+    // descent:         nacelles settled at hover tilt — translate + sink
     //
-    // CRITICAL: use target_hover_alt_m (= hover_alt_m + z_m) not hover_alt_m.
-    // For KAXX→KSAF: target_hover_alt_m = 30 + (-619) = -589m in ODE frame.
-    // hover_alt_m = 30m — using that causes DESCENT to trigger immediately
-    // after back_transition while still 650m above KSAF, causing a vertical
-    // drop 4.9km short of the destination.
-    double vx  = (n > 0) ? s[0] : 0.0;
+    // back_transition vs descent is defined by what the nacelles are doing,
+    // not altitude — back_transition IS the tilt-rotation window. (Was
+    // alt > target_hover_alt_m + 5.0, which for low-destination routes
+    // (e.g. KAXX→KSAF, target_hover_alt_m=-589m) kept the aircraft labeled
+    // back_transition long after tilt had already settled at hover.)
+    double vx   = (n > 0) ? s[0] : 0.0;
+    double tilt = (n > 2) ? s[2] : 0.0;
     double dx  = x - cfg->wp_x;
     double dy  = y - cfg->wp_y;
     double rng = std::sqrt(dx*dx + dy*dy);
@@ -266,12 +290,13 @@ static Phase get_phase(const double* s, int n, const APConfig* cfg) {
     if (vx > 25.0)                               return PHASE_FW_DESCENT;
 
     // Switch to final descent when within 300m of waypoint at low speed,
-    // regardless of altitude. This handles the case where the aircraft
-    // is close to the destination but still above target_hover_alt_m
-    // (e.g. KAXX→KSAF: aircraft is at alt_ode≈0 but 619m above KSAF).
+    // regardless of tilt. This handles the case where the aircraft is
+    // close to the pad but the nacelles haven't quite finished rotating —
+    // don't stall the approach waiting on the actuator.
     if (rng < 300.0 && vx < 8.0)                return PHASE_DESCENT;
 
-    if (alt > cfg->target_hover_alt_m + 5.0)     return PHASE_BACK_TRANSITION;
+    static constexpr double TILT_SETTLED_RAD = 0.035;   // ~2 deg
+    if (tilt > TILT_SETTLED_RAD)                 return PHASE_BACK_TRANSITION;
     return PHASE_DESCENT;
 }
 
@@ -483,26 +508,30 @@ static ControlOutput ctrl_dash(const double* s, const APConfig* cfg) {
 }
 
 static ControlOutput ctrl_fw_descent(const double* s, const APConfig* cfg) {
-    double vx      = s[0];
-    double tilt    = s[2];
     double omega_z = s[17];
 
-    // Tilt-compensated thrust: maintain 0.75*weight vertical force
-    // regardless of current nacelle tilt angle.
-    // At tilt=65deg (cruise): cos=0.42, thrust=1.79*weight (brief, tilt slewing fast)
-    // At tilt=30deg:          cos=0.87, thrust=0.86*weight
-    // At tilt=0deg (hover):   cos=1.00, thrust=0.75*weight (steady descent)
-    // Floor on cos_tilt prevents division by zero during tilt transition.
-    double cos_tilt   = std::max(std::cos(tilt), 0.25);
-    double thrust_cmd = std::min(cfg->weight_N * 0.75 / cos_tilt,
-                                 cfg->hover_thrust_N);
+    // Nacelles held at cruise tilt through this whole phase — rotation
+    // toward hover is back_transition's job, not fw_descent's. (Previously
+    // tilt_mode=0 here started the nacelles rotating the instant this phase
+    // was entered, which made "back_transition" start well before the phase
+    // machine said so.)
+    //
+    // Flat throttle-back to 0.35*weight — matches the value already assumed
+    // by descent_initiation_range() in mission_planner.jl ("ctrl_fw_descent
+    // cuts thrust to ~0.35*weight; estimate average decel ~0.7 m/s^2") but
+    // never actually implemented here. At fixed cruise tilt this single
+    // thrust deficit drains both altitude and airspeed together — no
+    // separate speed-target loop needed. Exit to BACK_TRANSITION is the
+    // existing vx<=25.0 check in get_phase(), which is the VCON/transition
+    // speed (bt_entry_ms) that descent_initiation_range() already assumes.
+    double thrust_cmd = cfg->weight_N * 0.35;
 
     ControlOutput o{};
     o.thrust_cmd = thrust_cmd;
     o.pitch_cmd  = 0.0;
     o.roll_cmd   = 0.0;
     o.yaw_cmd    = clamp(-omega_z * 2.0, -1.0, 1.0);
-    o.tilt_mode  = 0;
+    o.tilt_mode  = 1;
     o.autopilot  = true;
     o.brakes     = 0;
     return o;
@@ -631,6 +660,10 @@ static ControlOutput ctrl_descent(const double* s, int n, const APConfig* cfg) {
     // elevation-change routes (e.g. KAXX→KSAF drops 619 m).
     double agl = (n >= 19) ? s[18] : (alt - cfg->target_hover_alt_m);
 
+    // Vertical speed, appended by fly.jl as s[19] (n>=20) — see Channel 4
+    // (descent sink-rate PI) below. Falls back to 0.0 if unavailable.
+    double vz  = (n >= 20) ? s[19] : 0.0;
+
     // ── FLARE: arrest sink rate at low AGL ────────────────────────────
     // Trigger at 12 m AGL. Sink rate estimated from differenced agl at
     // callback rate — accurate enough this close to ground (Δagl ≈ 0.15–0.5 m
@@ -680,15 +713,31 @@ static ControlOutput ctrl_descent(const double* s, int n, const APConfig* cfg) {
 
     // ── Above flare altitude: translate toward pad ────────────────────
 
-    // [FIX-1] Range-gated thrust: 0.98W at arm (1500 m) → 0.78W at pad.
-    // Holds altitude during the approach so the aircraft does not descend
-    // through the approach path. Previously used a fixed 0.78W which caused
-    // the aircraft to sink 30–50 m during the 1500 m translate, landing short.
-    static constexpr double THRUST_FAR  = 0.98;
-    static constexpr double THRUST_NEAR = 0.78;
-    static constexpr double ARM_RNG_M   = 1500.0;
-    double rng_frac   = clamp(rng / ARM_RNG_M, 0.0, 1.0);
-    double thrust_cmd = cfg->weight_N * (THRUST_NEAR + (THRUST_FAR - THRUST_NEAR) * rng_frac);
+    // [Channel 4] Vertical-rate target: descent_rate_fw_ms above hover_alt_m
+    // AGL, land_descent_rate_ms once inside it — replaces the previous
+    // range-gated thrust profile (0.98W at arm -> 0.78W at pad), which was
+    // an open-loop guess at what altitude-hold "should" need rather than a
+    // targeted rate. vz convention is +climbing, so a 3 m/s descent target
+    // is vz_target = -3.0; see Channel 4 tuning note above PIGains — these
+    // gains are unvalidated starters.
+    double vz_target = (agl > cfg->hover_alt_m) ? -cfg->descent_rate_fw_ms
+                                                 : -cfg->land_descent_rate_ms;
+    double vz_err = vz_target - vz;   // negative = already sinking faster than target
+
+    double dt = get_ap_dt(tau);
+    I_descent_vz += vz_err * dt;
+    I_descent_vz = std::clamp(I_descent_vz,
+                              -PIG.I_descent_max / PIG.Ki_descent_vz,
+                               PIG.I_descent_max / PIG.Ki_descent_vz);
+
+    // Centered on 1.0×weight (level-hover-equivalent) — the PI term is
+    // entirely responsible for finding the thrust deficit that produces
+    // the target sink rate, same pattern as Channel 2's dash-speed PI.
+    double thrust_frac = 1.0 + PIG.Kp_descent_vz * vz_err + PIG.Ki_descent_vz * I_descent_vz;
+    double thrust_cmd  = cfg->weight_N * thrust_frac;
+    thrust_cmd = clamp(thrust_cmd, 0.3 * cfg->weight_N, 1.3 * cfg->weight_N);
+
+    static constexpr double ARM_RNG_M   = 1500.0;   // still used by pitch-gain scaling below
 
     // [FIX-2] close_frac fade zone: 50 m, not 200 m.
     // The original 200 m gate effectively zeroed the pitch command at any
