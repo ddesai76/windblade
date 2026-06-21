@@ -1,7 +1,7 @@
 # mission_planner.jl:   Mission profile loader and phase scheduler
 # AUTHOR:               DANIEL DESAI
-# UPDATED:              2026-05-10
-# VERSION:              0.1.0
+# UPDATED:              2026-06-21
+# VERSION:              0.1.1
 #
 #
 # Public interface
@@ -36,7 +36,7 @@ function load_mission(json_path::String)
 
         # Hover
         hover_alt_m          = g(hov, "alt_m",              30.0),
-        climb_rate_ms        = g(hov, "climb_rate_ms",       3.0),
+        climb_rate_ms        = g(hov, "climb_rate_ms",       4.0),
 
         # Transition
         trans_duration_s     = g(trn, "duration_s",         10.0),
@@ -46,16 +46,16 @@ function load_mission(json_path::String)
         dash_speed_kmh       = g(fw,  "dash_speed_kmh",    210.0),
         dash_altitude_m      = g(fw,  "dash_altitude_m",   300.0),
         climb_rate_fw_ms     = g(fw,  "climb_rate_fw_ms",    5.0),
-        descent_rate_fw_ms   = g(fw,  "descent_rate_fw_ms",  3.0),
+        descent_rate_fw_ms   = g(fw,  "descent_rate_fw_ms",  4.0),
 
         # Landing
         land_pitch_up_deg    = g(lnd, "pitch_up_deg",       35.0),
         land_pitch_up_rate_s = g(lnd, "pitch_up_rate_s",    4.0),
         land_pitch_hold_s    = g(lnd, "pitch_hold_s",       10.0),
         land_pitch_down_s    = g(lnd, "pitch_down_s",        4.0),
-        land_tilt_s          = g(lnd, "tilt_s",             12.0),
-        land_thrust_comp     = g(lnd, "thrust_comp",         0.6),
-        land_descent_rate_ms = g(lnd, "descent_rate_ms",    1.5),
+        land_tilt_s          = g(lnd, "tilt_s",             10.0),
+        land_thrust_comp     = g(lnd, "thrust_comp",         0.7),
+        land_descent_rate_ms = g(lnd, "descent_rate_ms",     1.5),
 
         # Departure airport / environment
         airport_icao         = gs(apt, "icao",             "KDEN"),
@@ -122,11 +122,16 @@ end
 
 function descent_initiation_range(tc)::Float64
     dash_ms      = tc.dash_speed_kmh / 3.6
-    bt_entry_ms  = 25.0     # fw_descent decelerates to this before back-transition
+    bt_entry_ms  = 50.0     # fw_descent decelerates to this before back-transition
 
     # fw_descent leg: decelerate from dash_speed to bt_entry_ms.
-    # ctrl_fw_descent cuts thrust to ~0.35×weight; estimate average decel ~0.7 m/s².
-    fw_desc_s    = (dash_ms - bt_entry_ms) / 0.7
+    # ctrl_fw_descent cuts thrust to 0.35×weight at fixed 65° tilt — the
+    # forward thrust component (0.35×sin(65°) ≈ 0.32×weight) is enough to
+    # mostly balance drag well above bt_entry_ms, so deceleration is far
+    # slower than a naive thrust-deficit estimate suggests. Measured ~0.28
+    # m/s² average from an actual fw_descent run; using 0.23 m/s² here
+    # (slightly conservative, single-run measurement)
+    fw_desc_s    = (dash_ms - bt_entry_ms) / 0.23
     fw_desc_dist = 0.5 * (dash_ms + bt_entry_ms) * fw_desc_s
 
     # back-transition leg: bt_entry_ms → 0 at half-speed average
