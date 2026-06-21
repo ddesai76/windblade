@@ -241,6 +241,8 @@ struct APConfig
     target_hover_alt_m   :: Cdouble   # hover_alt_m + z_m: descent target in ODE AGL frame
     dash_altitude_m      :: Cdouble
     dash_speed_ms        :: Cdouble
+    descent_rate_fw_ms   :: Cdouble   # sink-rate target above hover_alt_m AGL
+    land_descent_rate_ms :: Cdouble   # sink-rate target inside hover_alt_m AGL
     soc_min              :: Cdouble
     pitch_limit_rad      :: Cdouble
     roll_limit_rad       :: Cdouble
@@ -266,6 +268,8 @@ function make_ap_config()::APConfig
         Float64(TC.target_hover_alt_m),   # destination hover ref in ODE AGL frame
         Float64(TC.dash_altitude_m),
         Float64(TC.dash_speed_kmh) / 3.6,
+        Float64(TC.descent_rate_fw_ms),   # descent_rate_fw_ms
+        Float64(TC.land_descent_rate_ms), # land_descent_rate_ms
         0.10,                             # soc_min
         deg2rad(60.0),                    # pitch_limit_rad
         deg2rad(45.0),                    # roll_limit_rad
@@ -344,7 +348,17 @@ const AP_HANDOFF      = Threads.Atomic{Bool}(false)
 const _thrust_prev_cb = Ref(0.0)
 const _DESCENT_ARMED  = Ref(false)
 const _LANDED         = Ref(false)
-const AUTOLAND_RNG_M  = 1500.0
+# Was a disconnected hardcoded 1500m — autopilot.cpp's own back-transition
+# trigger (cfg->descent_initiation_m) fires several km out by design (see
+# descent_initiation_range() in mission_planner.jl), so _DESCENT_ARMED[]
+# here was staying false for the whole back-transition leg: build_ode's Fz
+# kept forcing the dash altitude-hold law while the autopilot had already
+# tilted nacelles down and cut thrust for a real descent, holding altitude
+# flat until the aircraft closed inside 1500m, then dumping the entire
+# owed descent into whatever distance was left. Use the same threshold
+# the autopilot was actually given so Fz responds to the real thrust_cmd
+# as soon as the autopilot starts trying to descend.
+const AUTOLAND_RNG_M  = Float64(DESCENT_INITIATION_M)
 
 # ══════════════════════════════════════════════════════════════════════
 #  HOTAS — shared state populated by the hotas reader subprocess
@@ -808,13 +822,15 @@ function make_saving_cb(rt_factor::Float64, dt_ref::Ref{Float64})
                         @warn "[AP] Descent armed at rng=$(round(_rng_now,digits=0))m  t=$(round(t,digits=1))s"
                     end
                 end
-                # Always pass terrain AGL as s[19] so ctrl_descent FLARE
-                # uses real terrain height regardless of airport elevation.
-                # Slice to the original 18 core states before appending so
-                # the C++ interface position of s[19] is stable even when
-                # the ODE state vector is extended (e.g. Dryden states 20–22).
+                # Always pass terrain AGL as s[19] (1-based)/s[18] (0-based C++)
+                # so ctrl_descent FLARE uses real terrain height regardless of
+                # airport elevation, and vz as the element after it so the new
+                # descent sink-rate PI (Channel 4) can read it. Slice to the
+                # original 18 core states before appending so the C++
+                # interface positions are stable even when the ODE state
+                # vector is extended (e.g. Dryden states 20–22).
                 _agl_t = Float64(alt) - terrain_alt(TERRAIN, Float64(x_m), Float64(y_m))
-                u_f64  = vcat(Float64.(u[1:18]), _agl_t)
+                u_f64  = vcat(Float64.(u[1:18]), _agl_t, Float64(_VZ_CACHE[]))
                 new_ctrl = compute_controls(u_f64, AP_CFG_REF)
                 AP_CTRL_CACHE[] = new_ctrl
                 if new_ctrl.autopilot == 0 && !AP_HANDOFF[]
@@ -859,9 +875,15 @@ function make_saving_cb(rt_factor::Float64, dt_ref::Ref{Float64})
                 Float64(tilt) > deg2rad(30.0) &&
                     Float64(alt) < TC.dash_altitude_m * 0.95 ? "fw_climb" : "dash"
             else
-                if Float64(tilt) > deg2rad(30.0); "fw_descent"
-                elseif abs(Float64(vx)) > 8.0;   "back_transition"
-                else;                             "descent"
+                # Matches autopilot.cpp get_phase(). fw_descent now holds
+                # tilt_mode=1 (cruise) for the whole phase, so vx>25 is still
+                # the correct fw_descent split. back_transition vs descent is
+                # now tilt-based, not altitude-based — back_transition IS the
+                # nacelle-rotation window; descent begins once they're
+                # settled near hover (same ~2° threshold as get_phase()).
+                if Float64(vx) > 25.0;                 "fw_descent"
+                elseif Float64(tilt) > deg2rad(2.0);    "back_transition"
+                else;                                    "descent"
                 end
             end
             _phase_base = if _raw_phase != _last_phase_cb[] &&
