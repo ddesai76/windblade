@@ -1,7 +1,7 @@
 # mission_planner.jl:   Mission profile loader and phase scheduler
 # AUTHOR:               DANIEL DESAI
-# UPDATED:              2026-06-21
-# VERSION:              0.1.1
+# UPDATED:              2026-06-22
+# VERSION:              0.1.2
 #
 #
 # Public interface
@@ -55,7 +55,8 @@ function load_mission(json_path::String)
         land_pitch_down_s    = g(lnd, "pitch_down_s",        4.0),
         land_tilt_s          = g(lnd, "tilt_s",             10.0),
         land_thrust_comp     = g(lnd, "thrust_comp",         0.7),
-        land_descent_rate_ms = g(lnd, "descent_rate_ms",     1.5),
+        land_descent_rate_ms = g(lnd, "descent_rate_ms",          1.5),
+        back_trans_entry_ms  = g(lnd, "back_trans_entry_ms",      50.0),
 
         # Departure airport / environment
         airport_icao         = gs(apt, "icao",             "KDEN"),
@@ -122,7 +123,7 @@ end
 
 function descent_initiation_range(tc)::Float64
     dash_ms      = tc.dash_speed_kmh / 3.6
-    bt_entry_ms  = 50.0     # fw_descent decelerates to this before back-transition
+    bt_entry_ms  = tc.back_trans_entry_ms
 
     # fw_descent leg: decelerate from dash_speed to bt_entry_ms.
     # ctrl_fw_descent cuts thrust to 0.35×weight at fixed 65° tilt — the
