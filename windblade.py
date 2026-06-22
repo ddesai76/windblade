@@ -2,8 +2,8 @@
 #
 # windblade.py:   Mission Planner and Launcher GUI
 # AUTHOR:         DANIEL DESAI
-# UPDATED:        2026-06-17
-# VERSION:        0.1.2
+# UPDATED:        2026-06-22
+# VERSION:        0.1.3
 
 """
 Single-file entry point.  Run and a browser window opens with the
@@ -125,7 +125,8 @@ def _build_argv(sim: dict, out_dir: Path,
     if arr_metar: argv += ["--arr-metar", arr_metar]
     if cru.get("speed_kmh"):            argv += ["--speed-kmh",      str(cru["speed_kmh"])]
     if cru.get("altitude_ft"):          argv += ["--alt-ft",          str(cru["altitude_ft"])]
-    if cru.get("hover_alt_m"):          argv += ["--hover-m",         str(cru["hover_alt_m"])]
+    if cru.get("hover_alt_m"):          argv += ["--hover-m",        str(cru["hover_alt_m"])]
+    if cru.get("back_trans_speed_ms"):  argv += ["--bt-speed-ms",    str(cru["back_trans_speed_ms"])]
     if cru.get("turbulence_intensity"): argv += ["--turb-intensity",  str(cru["turbulence_intensity"])]
     return argv
 
@@ -274,10 +275,11 @@ html,body{background:var(--bg);color:var(--nw);font-family:var(--mono);font-size
     <!-- Flight params -->
     <div class="panel" id="panel-flight">
       <div class="sec">Cruise</div>
-      <div class="row3">
+      <div style="display:grid;grid-template-columns:1fr 1fr 1fr 1fr;gap:20px;margin-bottom:18px">
         <div class="field"><label>Speed (km/h)</label><input id="speed" value="300" oninput="sync()"></div>
         <div class="field"><label>Altitude (ft MSL)</label><input id="alt" value="11500" oninput="sync()"></div>
         <div class="field"><label>Hover alt AGL (m)</label><input id="hover" value="30" oninput="sync()"></div>
+        <div class="field"><label>Back-trans speed (m/s)</label><input id="bt-speed" value="50" oninput="sync()" title="fw_descent decelerates to this speed before pitching up"></div>
       </div>
       <div class="sec">Turbulence (Dryden)</div>
       <div class="row2">
@@ -596,7 +598,7 @@ function getConfig(){
   return{
     dep_metar: v('dep-metar'),
     arr_metar: v('arr-metar'),
-    cruise:{speed_kmh:parseFloat(v('speed'))||300,altitude_ft:parseFloat(v('alt'))||11500,hover_alt_m:parseFloat(v('hover'))||30,turbulence_intensity:parseFloat(v('turb-intensity'))||0},
+    cruise:{speed_kmh:parseFloat(v('speed'))||300,altitude_ft:parseFloat(v('alt'))||11500,hover_alt_m:parseFloat(v('hover'))||30,back_trans_speed_ms:parseFloat(v('bt-speed'))||50,turbulence_intensity:parseFloat(v('turb-intensity'))||0},
     sim:{mode:v('mode'),speed_factor:parseInt(v('sfactor'))||1,
          terrain:sw.terrain,no_build:sw.nobuild,no_plan:sw.noplan,gui:sw.gui,db:sw.db},
 
