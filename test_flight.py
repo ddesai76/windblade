@@ -2,8 +2,8 @@
 #
 # <test_flight.py>:     Unified flight test runner>
 # Author:               DANIEL DESAI>
-# Updated:              2026-06-20
-# Version:              0.1.2
+# Updated:              2026-06-22
+# Version:              0.1.3
 
 """
 Usage:
@@ -21,7 +21,7 @@ Usage:
     python3 test_flight.py --auto \\
         --dep-metar "KAXX 151155Z 00000KT 10SM CLR M01/M10 A3018 RMK AO2 T10141096" \\
         --arr-metar "KSAF 151153Z 24005KT 10SM CLR 13/M09 A3005 RMK AO2 T01281094" \\
-        --speed-kmh 300 --alt-ft 11500 --hover-m 30
+        --speed-kmh 300 --alt-ft 11500 --hover-m 30 --bt-speed-ms 50
 
 planning/dash.py schema (used when --dep-metar/--arr-metar not supplied):
     SPEED_KMH    = 300.0       # cruise speed (km/h)
@@ -104,6 +104,7 @@ class DashConfig:
     speed_kmh:              float           = 300.0
     altitude_ft:            float           = 11500.0
     hover_alt_m:            float           = 30.0
+    back_trans_speed_ms:    float           = 50.0
     heading_deg:            Optional[float] = None
     turbulence_intensity_ms: float          = 0.0   # Dryden σ (m/s); 0=off
     terrain:     bool            = False
@@ -121,8 +122,9 @@ class DashConfig:
             speed_kmh   = float(getattr(mod, "SPEED_KMH",   300.0)),
             altitude_ft = float(getattr(mod, "ALTITUDE_FT", 11500.0)),
             hover_alt_m = float(getattr(mod, "HOVER_ALT_M", 30.0)),
-            heading_deg = getattr(mod, "HEADING_DEG", None),
-            terrain     = bool(getattr(mod,  "TERRAIN",     False)),
+            heading_deg          = getattr(mod, "HEADING_DEG", None),
+            terrain              = bool(getattr(mod,  "TERRAIN",              False)),
+            back_trans_speed_ms  = float(getattr(mod, "BACK_TRANS_SPEED_MS", 50.0)),
         )
 
 
@@ -380,10 +382,11 @@ def generate_test_card(dep: Airport, arr: Airport,
             "descent_rate_fw_ms": 4.0,
         },
         "landing": {
-            "pitch_up_deg":    35.0, "pitch_up_rate_s": 4.0,
-            "pitch_hold_s":   10.0, "pitch_down_s":    4.0,
-            "tilt_s":         12.0, "thrust_comp":     0.6,
-            "descent_rate_ms": 1.5,
+            "pitch_up_deg":       35.0, "pitch_up_rate_s":    4.0,
+            "pitch_hold_s":       10.0, "pitch_down_s":       4.0,
+            "tilt_s":             12.0, "thrust_comp":        0.6,
+            "descent_rate_ms":     1.5,
+            "back_trans_entry_ms": cfg.back_trans_speed_ms,
         },
         "airport": {
             "icao":                dep.icao,
@@ -1168,6 +1171,8 @@ def main():
                    help="Hover altitude AGL at destination (m). Overrides dash.py HOVER_ALT_M.")
     p.add_argument("--turb-intensity", type=float, default=None, metavar="MS",
                    help="Dryden turbulence intensity σ (m/s). 0=off, 1.5=light, 3.0=moderate, 6.0=severe.")
+    p.add_argument("--bt-speed-ms",    type=float, default=None, metavar="MS",
+                   help="Back-transition entry speed (m/s). fw_descent decelerates to this before pitch-up. Default 50.")
     args = p.parse_args()
 
     if args.speed is not None and args.manual:
@@ -1195,6 +1200,7 @@ def main():
     if args.alt_ft          is not None: cfg.altitude_ft             = args.alt_ft
     if args.hover_m         is not None: cfg.hover_alt_m             = args.hover_m
     if args.turb_intensity  is not None: cfg.turbulence_intensity_ms = args.turb_intensity
+    if args.bt_speed_ms     is not None: cfg.back_trans_speed_ms     = args.bt_speed_ms
 
     card_path = PLANNING / "test_card.json"
     csv_path: Optional[Path] = Path(args.csv).resolve() if args.csv else None
