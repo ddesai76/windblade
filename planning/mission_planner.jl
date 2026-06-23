@@ -45,6 +45,7 @@ function load_mission(json_path::String)
         # Fixed-wing  (dash_duration_s intentionally absent)
         dash_speed_kmh       = g(fw,  "dash_speed_kmh",    210.0),
         dash_altitude_m      = g(fw,  "dash_altitude_m",   300.0),
+        nacelle_tilt_deg     = g(fw,  "nacelle_tilt_deg",   65.0),
         climb_rate_fw_ms     = g(fw,  "climb_rate_fw_ms",    5.0),
         descent_rate_fw_ms   = g(fw,  "descent_rate_fw_ms",  4.0),
 
