@@ -1,7 +1,7 @@
 # fly.jl:         Advanced Air Mobility Tiltrotor Simulation
 # AUTHOR:         DANIEL DESAI
-# UPDATED:        2026-06-19
-# VERSION:        0.1.1
+# UPDATED:        2026-06-22
+# VERSION:        0.1.2
 #
 # Single entry point: loads subsystems, runs physics model, streams to glass_cockpit.jl
 #
@@ -515,7 +515,7 @@ function build_ode(du, u, p, t)
     # actually moves — no need to velocity-schedule the command itself.
     # The old vx_air-based schedule created a deadlock: tilt needs to
     # move to generate forward thrust, but tilt waited for forward speed.
-    tilt_cmd = ctrl.tilt_mode == 1 ? deg2rad(65.0) : 0.0
+    tilt_cmd = ctrl.tilt_mode == 1 ? deg2rad(TC.nacelle_tilt_deg) : 0.0
     ddtilt = actuator_accel(tilt, dtilt, tilt_cmd, CP.tilt_wn, CP.tilt_zeta)
 
     # ── Thrust (preflight ramp AUTO only) ─────────────────────────────
