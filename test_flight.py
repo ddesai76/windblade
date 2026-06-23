@@ -105,6 +105,7 @@ class DashConfig:
     altitude_ft:            float           = 11500.0
     hover_alt_m:            float           = 30.0
     back_trans_speed_ms:    float           = 50.0
+    nacelle_tilt_deg:       float           = 65.0
     heading_deg:            Optional[float] = None
     turbulence_intensity_ms: float          = 0.0   # Dryden σ (m/s); 0=off
     terrain:     bool            = False
@@ -125,6 +126,7 @@ class DashConfig:
             heading_deg          = getattr(mod, "HEADING_DEG", None),
             terrain              = bool(getattr(mod,  "TERRAIN",              False)),
             back_trans_speed_ms  = float(getattr(mod, "BACK_TRANS_SPEED_MS", 50.0)),
+            nacelle_tilt_deg     = float(getattr(mod, "NACELLE_TILT_DEG",   65.0)),
         )
 
 
@@ -380,6 +382,7 @@ def generate_test_card(dep: Airport, arr: Airport,
             "dash_altitude_m":    round(dash_alt_agl, 0),
             "climb_rate_fw_ms":   5.0,
             "descent_rate_fw_ms": 4.0,
+            "nacelle_tilt_deg":   max(45.0, min(90.0, cfg.nacelle_tilt_deg)),
         },
         "landing": {
             "pitch_up_deg":       35.0, "pitch_up_rate_s":    4.0,
@@ -1173,6 +1176,8 @@ def main():
                    help="Dryden turbulence intensity σ (m/s). 0=off, 1.5=light, 3.0=moderate, 6.0=severe.")
     p.add_argument("--bt-speed-ms",    type=float, default=None, metavar="MS",
                    help="Back-transition entry speed (m/s). fw_descent decelerates to this before pitch-up. Default 50.")
+    p.add_argument("--nacelle-tilt-deg", type=float, default=None, metavar="DEG",
+                   help="Cruise nacelle tilt angle (deg). Min 45, max 90, default 65.")
     args = p.parse_args()
 
     if args.speed is not None and args.manual:
@@ -1200,7 +1205,8 @@ def main():
     if args.alt_ft          is not None: cfg.altitude_ft             = args.alt_ft
     if args.hover_m         is not None: cfg.hover_alt_m             = args.hover_m
     if args.turb_intensity  is not None: cfg.turbulence_intensity_ms = args.turb_intensity
-    if args.bt_speed_ms     is not None: cfg.back_trans_speed_ms     = args.bt_speed_ms
+    if args.bt_speed_ms       is not None: cfg.back_trans_speed_ms     = args.bt_speed_ms
+    if args.nacelle_tilt_deg  is not None: cfg.nacelle_tilt_deg        = args.nacelle_tilt_deg
 
     card_path = PLANNING / "test_card.json"
     csv_path: Optional[Path] = Path(args.csv).resolve() if args.csv else None
