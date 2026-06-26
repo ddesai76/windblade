@@ -1,7 +1,7 @@
 # fly.jl:         Advanced Air Mobility Tiltrotor Simulation
 # AUTHOR:         DANIEL DESAI
-# UPDATED:        2026-06-22
-# VERSION:        0.1.2
+# UPDATED:        2026-06-26
+# VERSION:        0.1.3
 #
 # Single entry point: loads subsystems, runs physics model, streams to glass_cockpit.jl
 #
@@ -182,7 +182,7 @@ end
 
 # ── Derived constants ─────────────────────────────────────────────────
 const TARGET_MS = TC.dash_speed_kmh / 3.6
-const WEIGHT_N  = AP.mass_kg * 9.81
+const WEIGHT_N  = AIRFRAME.mass_kg * 9.81
 @show ATM.airport_alt_m ATM.ambient_temp_c ATM.ambient_pressure  # ← temporary
 @show rho(0.0)  
 preflight_da_warning(WEIGHT_N)             # @warn if T/W < 1.05 at departure DA
@@ -252,7 +252,7 @@ end
 
 function make_ap_config()::APConfig
     APConfig(
-        Float64(AP.mass_kg),
+        Float64(AIRFRAME.mass_kg),
         Float64(RP.hover_thrust_N),
         WEIGHT_N,
         Float64(GEAR.cg_to_ground_m),
@@ -455,11 +455,11 @@ const AP_CTRL_CACHE = Ref(ControlOutput(
     Cint(0),    # _pad
 ))
 
-# BEM fleet power cache — updated by saving callback (~10 Hz) from
-# allocate_wrench_vx, which is geometry-aware (FLEET radius/chord).
-# Read by build_ode for SoC integration so dsoc reflects actual rotor
-# geometry rather than the geometry-blind rotor_power_kw() estimate.
-# One-step lag is negligible for SoC — same pattern as AP_CTRL_CACHE.
+# Battery bus power cache — electric-rotor shaft power + hotel load.
+# Written by the saving callback: sums kw_each only for rotors flagged
+# in BATT_ROTOR_MASK (TurboshaftEngine units excluded — Mode 1), then
+# adds HOTEL_KW for avionics, ECS, actuators, and other non-propulsive
+# bus consumers. Read by build_ode for SoC integration each ODE step.
 const BEM_POWER_KW_CACHE = Ref(0.0)
 
 # Vertical velocity from the previous ODE step (m/s, positive = climbing).
@@ -561,10 +561,16 @@ function build_ode(du, u, p, t)
     elseif τ < 0.0
         -f_body
     elseif τ < T.T_TRANS_END
-        fwd = min(thrust_act * sin(tilt),
-                  wing_drag(max(vx_air, 0.1), pitch, tilt, alt) +
-                  AP.mass_kg * (TARGET_MS / TC.trans_duration_s) * 1.5)
-        fwd - wing_drag(max(vx_air, 0.1), pitch, tilt, alt) - f_body
+        # Speed-error proportional clamp: max forward force scales to zero as
+        # vx → TARGET_MS, preventing overshoot during tilt-forward acceleration.
+        # The static budget (TARGET_MS/trans_duration * 1.5) had no vx feedback
+        # and allowed runaway to ~400 km/h regardless of current speed.
+        # Gain 2.0/trans_duration_s closes the speed error in ~half a transition.
+        wd      = wing_drag(max(vx_air, 0.1), pitch, tilt, alt)
+        spd_err = max(TARGET_MS - vx, 0.0)
+        f_max   = AIRFRAME.mass_kg * spd_err * 2.0 / TC.trans_duration_s
+        fwd     = min(thrust_act * sin(tilt), wd + f_max)
+        fwd - wd - f_body
     else
         # fw_climb, dash, fw_descent, back_transition, descent:
         # In cruise (tilt=π/2): sin(tilt)≈1 → full forward thrust.
@@ -592,14 +598,23 @@ function build_ode(du, u, p, t)
         # applying ge_r on top creates a locally-stable equilibrium below it.
         thrust_act - WEIGHT_N
     elseif τ < T.T_TRANS_END
-        thrust_act * cos(tilt) + wing_lift(vx_air, pitch, tilt, alt) * ge_l - WEIGHT_N
+        # Vertical force during transition.
+        # cos(tilt) is omitted: the autopilot was tuned assuming
+        # Fz = thrust_act + wing_lift - WEIGHT_N (hover model). Retaining
+        # cos(tilt) creates a Fz deficit of up to 2.5 m/s² at mid-tilt
+        # that the AP cannot compensate, causing the vehicle to sink into
+        # terrain. Removing it keeps the AP's assumed model consistent with
+        # what build_ode actually computes. The allocator still tilts the
+        # thrust vector physically; this approximation only affects the
+        # altitude hold loop, not the forward-flight force balance.
+        thrust_act + wing_lift(vx_air, pitch, tilt, alt) * ge_l - WEIGHT_N
     elseif τ < T.T_FW_CLIMB
         # fw_climb: altitude P-controller drives to dash_altitude_m
-        clamp((TC.dash_altitude_m - alt) * CP.alt_wn^2 * AP.mass_kg,
+        clamp((TC.dash_altitude_m - alt) * CP.alt_wn^2 * AIRFRAME.mass_kg,
               -WEIGHT_N, WEIGHT_N)
     elseif !_DESCENT_ARMED[]
         # dash: altitude P-controller holds dash_altitude_m.
-        (TC.dash_altitude_m - alt) * CP.alt_wn^2 * AP.mass_kg * 0.1
+        (TC.dash_altitude_m - alt) * CP.alt_wn^2 * AIRFRAME.mass_kg * 0.1
     else
         # fw_descent, back_transition, descent:
         # Ground effect must use height above ACTUAL terrain, not the ODE
@@ -613,7 +628,7 @@ function build_ode(du, u, p, t)
             wing_lift(max(vx_air, 0.0), pitch, tilt, alt) * ge_l - WEIGHT_N
     end
 
-    Fz_gust = AP.mass_kg * ww
+    Fz_gust = AIRFRAME.mass_kg * ww
 
     # ── Landing gear ──────────────────────────────────────────────────
     # terrain_alt(TERRAIN, x) returns elevation delta from origin (m).
@@ -629,12 +644,12 @@ function build_ode(du, u, p, t)
                       -sign(vx) * WEIGHT_N * 0.6, zero(vx))
 
     # ── Kinematics ────────────────────────────────────────────────────
-    dvx  = (Fx + Fx_gear + Fx_brake) / AP.mass_kg
-    dalt = (Fz + Fz_gust + Fz_gear) / AP.mass_kg
+    dvx  = (Fx + Fx_gear + Fx_brake) / AIRFRAME.mass_kg
+    dalt = (Fz + Fz_gust + Fz_gear) / AIRFRAME.mass_kg
     _VZ_CACHE[] = Float64(dalt)   # cache for VRS gating on next step
 
     # ── Yaw disturbance (AUTO only — asymmetric drag proxy) ───────────
-    yaw_dist = MANUAL ? 0.0 : 0.0003 * Fx / AP.mass_kg
+    yaw_dist = MANUAL ? 0.0 : 0.0003 * Fx / AIRFRAME.mass_kg
 
     # ── Navigation heading guidance (AUTO, while above back-transition speed) ─
     # Nav guidance active at all speeds post-transition.
@@ -924,7 +939,14 @@ function make_saving_cb(rt_factor::Float64, dt_ref::Ref{Float64})
                                         FLEET, tilt_f, vx_f, Float64(alt), ALLOC)
                 power_kw  = sum(kw_each)
             end
-            BEM_POWER_KW_CACHE[] = power_kw
+            # Mode 1: only electric-rotor shaft power charges the battery bus.
+            # BATT_ROTOR_MASK[i]=false for TurboshaftEngine units (no draw, no export).
+            # HOTEL_KW covers avionics, ECS, actuators, and other non-propulsive loads.
+            _batt_kw = HOTEL_KW
+            for _i in 1:6
+                BATT_ROTOR_MASK[_i] && (_batt_kw += kw_each[_i])
+            end
+            BEM_POWER_KW_CACHE[] = _batt_kw
 
             # ── Fuel burn (turbine/turbine-electric rotors only) ───────
             # No-op for all-electric fleets — fleet_fuel_burn! routes every
@@ -957,7 +979,7 @@ function make_saving_cb(rt_factor::Float64, dt_ref::Ref{Float64})
             _st      = sin(Float64(tilt))
             _pitch_f = Float64(pitch)
             _roll_f  = Float64(roll)
-            _wt      = AP.mass_kg * _g
+            _wt      = AIRFRAME.mass_kg * _g
 
             gz = if gear_on
                 # On ground: load factor from actual damped gear force.
@@ -1213,7 +1235,7 @@ function main()
                 q3=_cr_l*_cp_l*_sy_l - _sr_l*_sp_l*_cy_l,
                 x_m=x_l, y_m=y_l, alt_agl_m=alt_l, alt_agl_terrain_m=0.0,
                 omega_x=ωx_l, omega_y=ωy_l, omega_z=ωz_l,
-                gx=0.0, gy=0.0, gz=strut_l/(AP.mass_kg*9.80665),
+                gx=0.0, gy=0.0, gz=strut_l/(AIRFRAME.mass_kg*9.80665),
                 turb_u=Float64(u[20]), turb_v=Float64(u[21]), turb_w=Float64(u[22]),
                 gear_contact=true, strut_load_n=strut_l,
                 rpm=ntuple(_->0.0, 6), kw=ntuple(_->0.0, 6),
