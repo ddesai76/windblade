@@ -1,7 +1,7 @@
 # rotor_system.jl:    Powerplant top-level model
 # AUTHOR:             DANIEL DESAI
-# UPDATED:            2026-06-19
-# VERSION:            0.1.3
+# UPDATED:            2026-06-25
+# VERSION:            0.1.4
 #
 # Motor swap patterns (all produce a valid RotorParams / RotorFleet):
 # ──────────────────────────────────────────────────────────────────────
@@ -62,7 +62,7 @@ Base.@kwdef struct RotorUnit
     radius_m     :: Float64        = BG.R      # default = BEM geometry radius
     kT           :: Float64        = 0.3592    # legacy scalar (used if use_bem=false)
     kQ           :: Float64        = 0.0473    # legacy scalar
-    omega_nom    :: Float64        = 130.9     # rad/s ≈ 1250 RPM (= 2π×1250/60)
+    omega_nom    :: Float64        = 100.53     # rad/s ≈ 960 RPM
     inertia      :: Float64        = 6.0
     eta_rotor    :: Float64        = 0.75
     k_induced    :: Float64        = 1.15
@@ -90,7 +90,7 @@ function _default_unit(i::Int) :: RotorUnit
         id         = i,
         label      = "R$i",
         radius_m   = BG.R,
-        omega_nom  = 130.9,   # 1250 RPM
+        omega_nom  = 100.53,   # 960 RPM
         arm_x_m    = x,
         arm_y_m    = y,
         arm_z_m    = z,
@@ -151,7 +151,7 @@ Base.@kwdef mutable struct RotorParams
     hover_thrust_N     :: Float64        = 26_055.0   # = sl × correction
     max_thrust_N       :: Float64        = 28_820.0   # ≈ 1.107 × hover (existing ratio)
     kT                 :: Float64        = 0.3592     # legacy only (BEM path ignores this)
-    omega0             :: Float64        = 130.9      # rad/s ≈ 1250 RPM
+    omega0             :: Float64        = 100.53      # rad/s ≈ 960 RPM
     inertia            :: Float64        = 6.0
     eta_rotor          :: Float64        = 0.75
     k_induced          :: Float64        = 1.15
@@ -269,6 +269,24 @@ tau_spool(rp::RotorParams)  = rp.inertia / (rp.kT * rp.omega0)
 
 const ROTOR_AREA = rotor_area(RP)
 const TAU_SPOOL  = tau_spool(RP)
+
+# Non-propulsive hotel load drawn from the battery bus at all times (kW).
+# Covers avionics, flight computers, ECS, cabin lighting, actuators, and
+# other consumers independent of rotor shaft power. Reference: Joby S4-class
+# vehicles estimate ~10 kW; 20 kW is conservative for a 6-pax vehicle with
+# full ECS and redundant avionics.
+const HOTEL_KW = 20.0
+
+# Per-rotor battery mask — true if the rotor draws from the battery bus.
+# Used by the saving callback in fly.jl to sum only electric-rotor kW into
+# BEM_POWER_KW_CACHE, implementing Mode 1: TurboshaftEngine rotors are fully
+# battery-independent (no draw, no export). HybridTurbineElectric is treated
+# as battery-drawing (Mode 2/3 battery coupling handled separately).
+# All-electric fleet → all true → cache equals full fleet sum (no change).
+const BATT_ROTOR_MASK = ntuple(
+    i -> !(FLEET.units[i].motor isa TurboshaftEngine),
+    6
+)
 
 # ── Ground Effect ──────────────────────────────────────────────────────
 """
