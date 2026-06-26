@@ -1,19 +1,16 @@
 # rotor_mixer.jl:     Wrench-to-RPM control allocator
 # AUTHOR:             DANIEL DESAI
-# UPDATED:            2026-05-10
-# VERSION:            0.1.0
+# UPDATED:            2026-06-23
+# VERSION:            0.1.1
 #
 # Post-solve mapping: takes the aggregate wrench demand from the flight
 # controller (total thrust + three moment demands) and distributes it
 # across the 6 RotorFleet units by solving the geometry matrix.
 #
-# DECOUPLED from the ODE — runs only in the saving callback on accepted
-# Float64 state values. Flight dynamics are completely unchanged.
-# Only rpm_r1…r6 and kw_r1…r6 in the CSV gain physical meaning.
 #
 # ── Conventions from rotor_system.jl ──────────────────────────────────
 #   Thrust :  T = kT · ρ · ω² · R⁴
-#   Torque :  Q = kQ · ρ · ω³ · R⁵   →   Q/T = (kQ/kT)·ω·R
+#   Torque :  Q = kQ · ρ · n² · D⁵   →   Q/T = (kQ/kT)·D = (kQ/kT)·2R  [m]
 #   Power  :  P_ind  = k_induced · T · vi / eta_rotor
 #             P_prof = c_profile · ρ · A · (ω·R)³
 #   spin_dir: +1 = CCW from above, -1 = CW from above
@@ -53,7 +50,7 @@
 # =====================================================================
 
 using StaticArrays
-using LinearAlgebra: pinv
+using LinearAlgebra: pinv, Diagonal
 
 # ── AllocatorParams ────────────────────────────────────────────────────
 """
@@ -96,6 +93,23 @@ Base.@kwdef struct AllocatorParams
     lift_only_rotors   :: NTuple{2,Int}  = (3, 4)
     lift_shutoff_tilt  :: Float64        = deg2rad(70.0)   # ≈ 70° → shut down
 
+    # ── Per-rotor power-preference weights ────────────────────────────────
+    # Diagonal of the column-weighting matrix W used in the weighted
+    # pseudoinverse: min ‖W⁻¹ · T_vec‖₂.
+    #
+    # A larger weight tells the allocator to "prefer" that rotor — it will
+    # be assigned proportionally more thrust before saturating neighbours.
+    # Set weights proportional to each rotor's rated shaft power so that,
+    # e.g., a turbine-electric "Super rotor" (420 kW) gets 4× the weight of
+    # a stock electric rotor (105 kW).
+    #
+    # Example for WINDBLADE mixed fleet (Super rotors on R1 & R2):
+    #   power_weights = (420.0, 420.0, 105.0, 105.0, 105.0, 105.0)
+    #
+    # Only the *ratios* matter — the allocator normalises internally.
+    # Equal weights reproduce the original uniform pseudoinverse behaviour.
+    power_weights :: NTuple{6,Float64} = (1.0, 1.0, 1.0, 1.0, 1.0, 1.0)
+
     # Autorotation model for windmilling lift-only rotors in cruise.
     #
     # A windmilling rotor in edgewise flow reaches an equilibrium speed where
@@ -134,7 +148,12 @@ Base.@kwdef struct AllocatorParams
     autorotate_Cp  :: Float64 = 0.05   # rotor power coefficient — drag-minimised autorotation
 end
 
-const ALLOC = AllocatorParams()
+const ALLOC = AllocatorParams(power_weights = (746.0, 746.0, 280.0, 280.0, 280.0, 280.0))
+# power_weights set to rated shaft power (kW) per rotor class:
+#   R1/R2: TurboshaftEngine P_sl_W = 746 kW (1000 hp design point, powerplant.jl default)
+#   R3–R6: ElectricMotor P_max_W  = 280 kW (rotor_system.jl default)
+# Only ratios matter (allocator normalises internally); using rated kW directly
+# is self-documenting and survives rotor config changes without manual rescaling.
 
 # ── Lift-rotor autorotation helpers ───────────────────────────────────
 """
@@ -197,9 +216,13 @@ function build_B(fleet::RotorFleet,
         ry = u.arm_y_m
         sd = Float64(u.spin_dir)   # +1=CCW, -1=CW
 
-        # Reaction torque arm at nominal RPM (metres, effective)
-        # Q/T = (kQ/kT)·ω·R  at ω = omega_nom
-        torque_arm = (u.kQ / u.kT) * u.omega_nom * u.radius_m
+        # Yaw torque arm: Q/T = (kQ/kT)·D where D = 2·R
+        # Follows from the propeller coefficient convention used in blades.jl:
+        #   T = kT·ρ·n²·D⁴  and  Q = kQ·ρ·n²·D⁵  (n in rev/s, D = 2R)
+        # The n²·D factors cancel exactly, leaving a pure length in metres.
+        # The previous formula (kQ/kT)·ω_nom·R incorrectly included ω_nom,
+        # inflating the yaw arm by ω_nom/2 ≈ 65× and over-weighting yaw authority.
+        torque_arm = (u.kQ / u.kT) * 2.0 * u.radius_m   # [m], τᵢ ≈ 0.382 m default
 
         # Lift-only rotors contribute nothing to the wrench in cruise —
         # zero their column so the pseudoinverse ignores them entirely.
@@ -207,14 +230,50 @@ function build_B(fleet::RotorFleet,
 
         B[1, i] = ap.w_thrust * 1.0            * active
         B[2, i] = ap.w_roll   * ry * ct        * active
-        B[3, i] = ap.w_pitch  * (-rx) * ct     * active
+        B[3, i] = ap.w_pitch  * rx * ct        * active
         B[4, i] = ap.w_yaw    * (-sd) * torque_arm * ct * active
     end
 
     return SMatrix{4,6,Float64}(B)
 end
 
-# ── Core allocator ─────────────────────────────────────────────────────
+# ── Power-weighted pseudoinverse ───────────────────────────────────────
+"""
+    build_Bp_weighted(B, ap) → SMatrix{6,4,Float64}
+
+Computes the power-weighted pseudoinverse of the control effectiveness
+matrix B.
+
+The standard `pinv(B)` minimises ‖T_vec‖₂ uniformly across all rotors.
+Here we minimise ‖W⁻¹ · T_vec‖₂ instead, where W = diag(power_weights
+normalised so max = 1). This biases the solution toward rotors with
+higher rated power: they receive proportionally larger thrust assignments
+before the solver burdens lower-rated neighbours.
+
+Derivation:
+  Define scaled matrix  B̃ = B · W          (4×6)
+  Solve  min ‖T̃‖₂  subject to  B · W · T̃ = wrench
+  Recover  T_vec = W · T̃  →  T_vec = W · pinv(B̃) · wrench
+
+So the weighted pseudoinverse is:
+  Bp_w = W · pinv(B · W)
+
+Called from `allocate_wrench` in place of the bare `pinv(B)`.
+"""
+function build_Bp_weighted(B::SMatrix{4,6,Float64},
+                           ap::AllocatorParams) :: SMatrix{6,4,Float64}
+    # Normalise so the largest weight = 1 (preserves total thrust scale).
+    w_max  = maximum(ap.power_weights)
+    w_norm = ap.power_weights ./ max(w_max, 1e-9)
+    W      = Diagonal(SVector{6,Float64}(w_norm))   # 6×6
+
+    # Scaled effectiveness matrix and its pseudoinverse.
+    B_scaled  = B * W                                          # 4×6
+    Bp_scaled = SMatrix{6,4,Float64}(pinv(Matrix(B_scaled)))  # 6×4
+
+    # Un-scale: multiply back by W to recover T_vec in original units.
+    return SMatrix{6,4,Float64}(W * Bp_scaled)
+end
 """
     allocate_wrench(T_total, M_roll, M_pitch, M_yaw,
                     fleet, tilt_rad, rho_rel, ap)
@@ -235,9 +294,9 @@ function allocate_wrench(T_total::Float64,
 
     ρ = max(rho_rel * 1.225, 0.01)   # kg/m³
 
-    # ── 1. Pseudoinverse solution ──────────────────────────────────────
+    # ── 1. Power-weighted pseudoinverse solution ───────────────────────
     B  = build_B(fleet, tilt_rad, ap)
-    Bp = SMatrix{6,4,Float64}(pinv(Matrix(B)))
+    Bp = build_Bp_weighted(B, ap)   # prefers high-power rotors via W·pinv(B·W)
     w  = SVector{4,Float64}(T_total, M_roll, M_pitch, M_yaw)
     T_vec = MVector{6,Float64}(Bp * w)   # per-rotor thrust (N), may have negatives
 
@@ -433,17 +492,20 @@ function alloc_selftest()
     println("  Left > Right: $(ok2 ? "✓ PASS" : "✗ FAIL")  (expect true — left side lifts right wing)")
     println()
 
-    # ── Test 3: pitch demand — rear rotors spin faster ─────────────────
-    # +My = nose-up → rear rotors (arm_x < 0: R5,R6) spin up
+    # ── Test 3: pitch demand — forward rotors spin faster ───────────────
+    # +My = nose-up → forward rotors (arm_x > 0: R1,R2) spin up.
+    # Rotors thrust upward. More thrust at the nose lifts it; less at
+    # the tail lets it drop. B[3,i] = +arm_x so fwd rotors (+x) get a
+    # positive pitch coefficient and spin up for +My demand.
     rpms3, _ = allocate_wrench(T_hov, 0.0, 500.0, 0.0, FLEET, 0.0, rho_sl)
     fwd  = (rpms3[1] + rpms3[2]) / 2.0   # R1,R2  arm_x=+3.0
     aft  = (rpms3[5] + rpms3[6]) / 2.0   # R5,R6  arm_x=−3.0
-    ok3  = aft > fwd
+    ok3  = fwd > aft
     push!(pass, ok3)
     println("Test 3 — Pitch +500 N·m (nose-up), hover:")
     println("  ω (rad/s) : ", round.(rpms3, digits=1))
     println("  Fwd mean (R1,R2): $(round(fwd, digits=1))  Aft mean (R5,R6): $(round(aft, digits=1))")
-    println("  Aft > Fwd: $(ok3 ? "✓ PASS" : "✗ FAIL")  (expect true — aft rotors push nose up)")
+    println("  Fwd > Aft: $(ok3 ? "✓ PASS" : "✗ FAIL")  (expect true — fwd rotors lift nose)")
     println()
 
     # ── Test 4: yaw demand — CW rotors spin faster ─────────────────────
@@ -505,6 +567,26 @@ function alloc_selftest()
     println("  Lift kW negative (regen): $(lift_kw_neg ? "✓" : "✗")")
     println("  Tilting rotors spinning:  $(tilt_spin  ? "✓" : "✗")")
     println("  $(ok6 ? "✓ PASS" : "✗ FAIL")")
+    println()
+
+    # ── Test 7: power-weighted allocation prefers high-power rotors ───────
+    # R1 & R2 rated 4× higher than R3–R6. Under a symmetric hover demand,
+    # R1/R2 should carry substantially more thrust than the stock rotors.
+    # Note: ALLOC itself now uses (746,746,280,280,280,280) — ratio ≈2.66×.
+    # This test uses an explicit 4× ratio to verify the mechanism cleanly.
+    ap_biased = AllocatorParams(power_weights = (4.0, 4.0, 1.0, 1.0, 1.0, 1.0))
+    rpms7, _ = allocate_wrench(T_hov, 0.0, 0.0, 0.0, FLEET, 0.0, rho_sl, ap_biased)
+    T7 = ntuple(i -> FLEET.units[i].kT * 1.225 * rpms7[i]^2 * FLEET.units[i].radius_m^4, 6)
+    hi_mean = (T7[1] + T7[2]) / 2.0
+    lo_mean = (T7[3] + T7[4] + T7[5] + T7[6]) / 4.0
+    ok7 = hi_mean > lo_mean * 1.5   # expect ~4× loading ratio
+    push!(pass, ok7)
+    println("Test 7 — Power-weighted hover (R1/R2 rated 4× R3–R6):")
+    println("  ω (rad/s)          : ", round.(rpms7, digits=1))
+    println("  Thrust R1/R2 mean  : $(round(hi_mean, digits=0)) N")
+    println("  Thrust R3–R6 mean  : $(round(lo_mean, digits=0)) N")
+    println("  Hi/Lo ratio        : $(round(hi_mean / max(lo_mean,1e-6), digits=2))×  (expect ≈ 4×)")
+    println("  $(ok7 ? "✓ PASS" : "✗ FAIL")")
     println()
 
     println("=== $(count(pass))/$(length(pass)) tests passed ===\n")
