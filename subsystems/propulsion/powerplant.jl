@@ -1,7 +1,7 @@
 # powerplant.jl:    Propulsor model (AbstractMotor hierarchy)
 # AUTHOR:           DANIEL DESAI
-# UPDATED:          2026-06-17
-# VERSION:          0.1.0
+# UPDATED:          2026-06-25
+# VERSION:          0.1.1
 #
 #
 # Depends on: fuel.jl (fuel chemistry + tank capacity — see that file's
@@ -101,7 +101,7 @@ const _RHO_SL = 1.225   # ISA SL density used internally
     ElectricMotor
 
 Permanent-magnet synchronous motor (PMSM) with:
-  - Peak shaft power ceiling P_max_W (default 200 kW per rotor)
+  - Peak shaft power ceiling P_max_W (default 280 kW per rotor)
   - Altitude de-rating above cool_alt_m (cooling air density drop)
   - Simple winding thermal model for thermal de-rating
 
@@ -114,9 +114,9 @@ Motor swap example:
         2 => RotorUnit(_default_unit(2); motor = ElectricMotor(P_max_W=250_000.0))))
 """
 Base.@kwdef mutable struct ElectricMotor <: AbstractMotor
-    P_max_W        ::Float64 = 200_000.0  # peak shaft power (W)
+    P_max_W        ::Float64 = 280000.0  # peak shaft power (W)
     eta_peak       ::Float64 = 0.96       # peak motor efficiency
-    eta_rpm_peak   ::Float64 = 1250.0     # RPM at peak efficiency
+    eta_rpm_peak   ::Float64 = 960.0     # RPM at peak efficiency
     thermal_mass   ::Float64 = 2.0        # winding heat capacity (kJ/K)
     tau_thermal_s  ::Float64 = 120.0      # winding cooling time constant (s)
     T_cont_C       ::Float64 = 100.0      # continuous winding temperature (°C)
