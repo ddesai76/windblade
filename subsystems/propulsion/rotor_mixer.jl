@@ -1,7 +1,7 @@
 # rotor_mixer.jl:     Wrench-to-RPM control allocator
 # AUTHOR:             DANIEL DESAI
-# UPDATED:            2026-06-23
-# VERSION:            0.1.1
+# UPDATED:            2026-06-29
+# VERSION:            0.1.2
 #
 # Post-solve mapping: takes the aggregate wrench demand from the flight
 # controller (total thrust + three moment demands) and distributes it
@@ -83,7 +83,7 @@ Base.@kwdef struct AllocatorParams
 
     # Lift-only rotor shutdown
     # Indices of rotors that provide lift only and do not produce thrust in
-    # cruise. In the Joby S4 configuration these are R3 and R4 (mid-L /
+    # cruise. In the default configuration these are R3 and R4 (mid-L /
     # mid-R, arm_x=0). All six rotors share the same nacelle tilt angle —
     # the mid rotors do not fold or reorient; they windmill (autorotate) in
     # cruise rather than tilting out of the way.
@@ -94,17 +94,14 @@ Base.@kwdef struct AllocatorParams
     lift_shutoff_tilt  :: Float64        = deg2rad(70.0)   # ≈ 70° → shut down
 
     # ── Per-rotor power-preference weights ────────────────────────────────
-    # Diagonal of the column-weighting matrix W used in the weighted
+    # Diagonal of the column-weighting matrix Λp used in the weighted
     # pseudoinverse: min ‖W⁻¹ · T_vec‖₂.
     #
     # A larger weight tells the allocator to "prefer" that rotor — it will
     # be assigned proportionally more thrust before saturating neighbours.
     # Set weights proportional to each rotor's rated shaft power so that,
-    # e.g., a turbine-electric "Super rotor" (420 kW) gets 4× the weight of
-    # a stock electric rotor (105 kW).
-    #
-    # Example for WINDBLADE mixed fleet (Super rotors on R1 & R2):
-    #   power_weights = (420.0, 420.0, 105.0, 105.0, 105.0, 105.0)
+    # e.g., a turbine-electric "Super rotor" (630 kW) gets 2.25× the weight of
+    # a stock electric rotor (280 kW).
     #
     # Only the *ratios* matter — the allocator normalises internally.
     # Equal weights reproduce the original uniform pseudoinverse behaviour.
@@ -148,7 +145,7 @@ Base.@kwdef struct AllocatorParams
     autorotate_Cp  :: Float64 = 0.05   # rotor power coefficient — drag-minimised autorotation
 end
 
-const ALLOC = AllocatorParams(power_weights = (746.0, 746.0, 280.0, 280.0, 280.0, 280.0))
+const ALLOC = AllocatorParams(power_weights = (280.0, 280.0, 280.0, 280.0, 280.0, 280.0))
 # power_weights set to rated shaft power (kW) per rotor class:
 #   R1/R2: TurboshaftEngine P_sl_W = 746 kW (1000 hp design point, powerplant.jl default)
 #   R3–R6: ElectricMotor P_max_W  = 280 kW (rotor_system.jl default)
@@ -245,18 +242,18 @@ Computes the power-weighted pseudoinverse of the control effectiveness
 matrix B.
 
 The standard `pinv(B)` minimises ‖T_vec‖₂ uniformly across all rotors.
-Here we minimise ‖W⁻¹ · T_vec‖₂ instead, where W = diag(power_weights
+Here we minimise ‖W⁻¹ · T_vec‖₂ instead, where Λp = diag(power_weights
 normalised so max = 1). This biases the solution toward rotors with
 higher rated power: they receive proportionally larger thrust assignments
 before the solver burdens lower-rated neighbours.
 
 Derivation:
-  Define scaled matrix  B̃ = B · W          (4×6)
-  Solve  min ‖T̃‖₂  subject to  B · W · T̃ = wrench
-  Recover  T_vec = W · T̃  →  T_vec = W · pinv(B̃) · wrench
+  Define scaled matrix  B̃ = B · Λp          (4×6)
+  Solve  min ‖T̃‖₂  subject to  B · Λp · T̃ = wrench
+  Recover  T_vec = W · T̃  →  T_vec = Λp · pinv(B̃) · wrench
 
 So the weighted pseudoinverse is:
-  Bp_w = W · pinv(B · W)
+  Bp_w = Λp · pinv(B · Λp)
 
 Called from `allocate_wrench` in place of the bare `pinv(B)`.
 """
@@ -265,14 +262,14 @@ function build_Bp_weighted(B::SMatrix{4,6,Float64},
     # Normalise so the largest weight = 1 (preserves total thrust scale).
     w_max  = maximum(ap.power_weights)
     w_norm = ap.power_weights ./ max(w_max, 1e-9)
-    W      = Diagonal(SVector{6,Float64}(w_norm))   # 6×6
+    lambda_p = Diagonal(SVector{6,Float64}(w_norm))   # 6×6
 
     # Scaled effectiveness matrix and its pseudoinverse.
-    B_scaled  = B * W                                          # 4×6
+    B_scaled  = B * lambda_p                                          # 4×6
     Bp_scaled = SMatrix{6,4,Float64}(pinv(Matrix(B_scaled)))  # 6×4
 
-    # Un-scale: multiply back by W to recover T_vec in original units.
-    return SMatrix{6,4,Float64}(W * Bp_scaled)
+    # Un-scale: multiply back by Λp to recover T_vec in original units.
+    return SMatrix{6,4,Float64}(lambda_p * Bp_scaled)
 end
 """
     allocate_wrench(T_total, M_roll, M_pitch, M_yaw,
@@ -296,7 +293,7 @@ function allocate_wrench(T_total::Float64,
 
     # ── 1. Power-weighted pseudoinverse solution ───────────────────────
     B  = build_B(fleet, tilt_rad, ap)
-    Bp = build_Bp_weighted(B, ap)   # prefers high-power rotors via W·pinv(B·W)
+    Bp = build_Bp_weighted(B, ap)   # prefers high-power rotors via Λp·pinv(B·Λp)
     w  = SVector{4,Float64}(T_total, M_roll, M_pitch, M_yaw)
     T_vec = MVector{6,Float64}(Bp * w)   # per-rotor thrust (N), may have negatives
 
