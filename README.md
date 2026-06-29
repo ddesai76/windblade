@@ -169,8 +169,8 @@ Rotor geometry is defined in `subsystems/propulsion/rotor_config.csv`. Default c
 | Chord | 0.183 m |
 | Twist root/tip | 16° / 6° |
 | Pitch offset | 4.4° |
-| Max power | 420 kW per rotor |
-| Hover RPM | 720 |
+| Max power | 630 kW per rotor |
+| Hover RPM | 960 |
 | Powerplant | `turbine_electric` |
 
 **Electric, stock (R3–R6):**
@@ -183,7 +183,7 @@ Rotor geometry is defined in `subsystems/propulsion/rotor_config.csv`. Default c
 | Twist root/tip | 16° / 6° |
 | Pitch offset | 4.4° |
 | Max power | 280 kW per rotor |
-| Hover RPM | 720 |
+| Hover RPM | 960 |
 | Powerplant | `electric` |
 
 Edit `rotor_config.csv` and reload the Rotor Config tab in the GUI to apply changes without restart. A `turbine_electric` row requires fuel tank (`FuelTank`) and fuel chemistry (`FuelProperties`) parameters set in `fuel.jl`. `powerplant.jl` implements a `TurboshaftEngine` model (Gagg–Ferrar altitude lapse, derived SFC from thermal efficiency). Both files are loaded unconditionally by `rotor_system.jl` regardless of fleet composition.
