@@ -1,7 +1,7 @@
 # rotor_mixer.jl:     Wrench-to-RPM control allocator
 # AUTHOR:             DANIEL DESAI
 # UPDATED:            2026-06-29
-# VERSION:            0.1.3
+# VERSION:            0.1.4
 #
 # Post-solve mapping: takes the aggregate wrench demand from the flight
 # controller (total thrust + three moment demands) and distributes it
@@ -42,6 +42,16 @@
 #   At cruise (tilt=π/2): rotors point forward, their thrust adds in x not z,
 #                         so body-frame moment contributions → 0. Aerodynamics
 #                         takes over. cos(tilt) captures this continuously.
+#
+# ── Rotor mode classification ─────────────────────────────────────────
+#   lift_only_rotors  : active in hover, windmill in cruise (tilt > lift_shutoff_tilt)
+#   cruise_only_rotors: inactive in hover, active in cruise (tilt ≥ cruise_activation_tilt)
+#   (all others)      : tiltrotors — active across the full tilt range
+#
+#   BETA-mode example: set cruise_only_rotors = (5, 6) and
+#     cruise_activation_tilt = deg2rad(45.0). R5/R6 are treated as
+#     fixed pusher props that engage mid-transition and carry cruise thrust.
+#     lift_only_rotors = () in that configuration (no windmilling rotors).
 #
 # ── Allocator formulation ─────────────────────────────────────────────
 #   Solves:  T = arg min_{T ≥ 0} ‖BT - w‖_{Λp⁻²}
@@ -97,9 +107,22 @@ Base.@kwdef struct AllocatorParams
     # cruise rather than tilting out of the way.
     # These rotors are held at omega_min once tilt exceeds `lift_shutoff_tilt`
     # so the NNLS solver does not assign them spurious small thrust values.
-    # Set to an empty tuple for a fully-tilting all-rotor configuration.
-    lift_only_rotors   :: NTuple{2,Int}  = (3, 4)
-    lift_shutoff_tilt  :: Float64        = deg2rad(70.0)   # ≈ 70° → shut down
+    # Defaults to an empty tuple for a fully-tilting all-rotor configuration.
+    lift_only_rotors   :: Tuple{Vararg{Int}} = ()
+    lift_shutoff_tilt  :: Float64            = deg2rad(70.0)   # tilt at which hover rotors disengage
+
+    # Cruise-only rotors (e.g. fixed pusher props, BETA-style)
+    # Rotors listed here are held at omega_min in hover and become active
+    # once tilt reaches `cruise_activation_tilt`. Their B-matrix columns
+    # are zeroed below that threshold so the NNLS ignores them in hover - 
+    # set cruise_only_rotors = (5, 6) (or whichever indices
+    # are the pusher props) and tune cruise_activation_tilt to the tilt
+    # angle at which those props reach useful efficiency. Overlap with
+    # lift_shutoff_tilt is intentional — both rotor sets briefly active
+    # during transition ensures no thrust deficit at handoff.
+    # Defauls to an empty tuple — all rotors tilt together.
+    cruise_only_rotors     :: Tuple{Vararg{Int}} = ()
+    cruise_activation_tilt :: Float64            = deg2rad(45.0)   # tilt at which pusher rotors engage
 
     # ── Per-rotor power-preference weights (Λp diagonal) ──────────────
     # Diagonal entries of Λp = diag(p₁,…,p₆), the column-weighting matrix
@@ -153,7 +176,7 @@ Base.@kwdef struct AllocatorParams
     autorotate_Cp  :: Float64 = 0.05   # rotor power coefficient — drag-minimised autorotation
 end
 
-const ALLOC = AllocatorParams(power_weights = (746.0, 746.0, 280.0, 280.0, 280.0, 280.0))
+const ALLOC = AllocatorParams(power_weights = (280.0, 280.0, 280.0, 280.0, 280.0, 280.0))
 # power_weights are the Λp diagonal entries, set to rated shaft power (kW) per rotor class:
 #   R1/R2: TurboshaftEngine P_sl_W = 746 kW (1000 hp design point, powerplant.jl default)
 #   R3–R6: ElectricMotor P_max_W  = 280 kW (rotor_system.jl default)
@@ -172,6 +195,33 @@ Returns `false` when rotor `i` is a lift-only rotor and tilt has exceeded
                                    ap::AllocatorParams=ALLOC) :: Bool
     i ∈ ap.lift_only_rotors || return true
     return tilt_rad < ap.lift_shutoff_tilt
+end
+
+"""
+    cruise_rotor_active(i, tilt_rad, ap) → Bool
+
+Returns `true` when rotor `i` should be producing thrust. For cruise-only
+rotors (e.g. pusher props) this is `false` below `cruise_activation_tilt`
+and `true` above it. For all other rotors this always returns `true` —
+the lift-only gate is handled separately by `lift_rotor_active`.
+"""
+@inline function cruise_rotor_active(i::Int,
+                                     tilt_rad::Float64,
+                                     ap::AllocatorParams=ALLOC) :: Bool
+    i ∈ ap.cruise_only_rotors || return true
+    return tilt_rad ≥ ap.cruise_activation_tilt
+end
+
+"""
+    rotor_active(i, tilt_rad, ap) → Bool
+
+Combined gate: rotor `i` is producing thrust only when both
+`lift_rotor_active` and `cruise_rotor_active` are satisfied.
+"""
+@inline function rotor_active(i::Int,
+                               tilt_rad::Float64,
+                               ap::AllocatorParams=ALLOC) :: Bool
+    return lift_rotor_active(i, tilt_rad, ap) && cruise_rotor_active(i, tilt_rad, ap)
 end
 
 """
@@ -229,9 +279,10 @@ function build_B(fleet::RotorFleet,
         # inflating the yaw arm by ω_nom/2 ≈ 65× and over-weighting yaw authority.
         torque_arm = (u.kQ / u.kT) * 2.0 * u.radius_m   # [m], τᵢ ≈ 0.382 m default
 
-        # Lift-only rotors contribute nothing to the wrench in cruise —
-        # zero their column so the NNLS solver ignores them entirely.
-        active = lift_rotor_active(i, tilt_rad, ap) ? 1.0 : 0.0
+        # Rotor is active only when both lift and cruise gates pass:
+        #   lift_rotor_active: false for lift-only rotors past shutoff tilt
+        #   cruise_rotor_active: false for cruise-only rotors below activation tilt
+        active = rotor_active(i, tilt_rad, ap) ? 1.0 : 0.0
 
         B[1, i] = ap.w_thrust * 1.0                      * active
         B[2, i] = ap.w_roll   * ry * ct                  * active
@@ -280,7 +331,7 @@ function allocate_wrench(T_total::Float64,
     # ── 2. Thrust → ω ─────────────────────────────────────────────────
     rpms = ntuple(6) do i
         u = fleet.units[i]
-        !lift_rotor_active(i, tilt_rad, ap) && return ap.omega_min
+        !rotor_active(i, tilt_rad, ap) && return ap.omega_min
         ω = sqrt(max(T_vec[i], 0.0) / (u.kT * ρ * u.radius_m^4 + 1e-9))
         clamp(ω, ap.omega_min, ap.omega_max)
     end
@@ -288,7 +339,7 @@ function allocate_wrench(T_total::Float64,
     # ── 3. Power (hover-mode induced velocity, vx=0) ───────────────────
     kws = ntuple(6) do i
         u = fleet.units[i]
-        !lift_rotor_active(i, tilt_rad, ap) && return 0.0
+        !rotor_active(i, tilt_rad, ap) && return 0.0
         ω_i    = rpms[i]
         A_i    = π * u.radius_m^2
         T_i    = u.kT * ρ * ω_i^2 * u.radius_m^4
@@ -383,17 +434,25 @@ function allocate_wrench_vx(T_total::Float64,
     rpms, _ = allocate_wrench(T_total, M_roll, M_pitch, M_yaw,
                                fleet, tilt_rad, rho_r, ap)
 
-    # Override windmilling rotors with vx-dependent autorotation RPM
+    # Override inactive rotors with appropriate RPM:
+    #   lift-only past shutoff → autorotate at vx-dependent ω
+    #   cruise-only below activation → hold omega_min (not yet spinning up)
     rpms = ntuple(6) do i
-        lift_rotor_active(i, tilt_rad, ap) ? rpms[i] :
-            autorotate_omega(fleet.units[i], v, ap)
+        if !lift_rotor_active(i, tilt_rad, ap)
+            return autorotate_omega(fleet.units[i], v, ap)   # windmilling
+        elseif !cruise_rotor_active(i, tilt_rad, ap)
+            return ap.omega_min                               # not yet active
+        else
+            return rpms[i]
+        end
     end
 
     kws = ntuple(6) do i
-        u   = fleet.units[i]
-        # Windmilling: negative kW (regenerative)
+        u = fleet.units[i]
         if !lift_rotor_active(i, tilt_rad, ap)
-            return autorotate_kw(u, v, ρ, ap)
+            return autorotate_kw(u, v, ρ, ap)   # windmilling: negative kW (regen)
+        elseif !cruise_rotor_active(i, tilt_rad, ap)
+            return 0.0                           # cruise-only rotor not yet active
         end
         ω_i = rpms[i]
         A_i = π * u.radius_m^2
@@ -454,7 +513,7 @@ end
 """
     alloc_selftest()
 
-Seven sanity checks. Run from the REPL after loading rotor_system.jl:
+Eight sanity checks. Run from the REPL after loading rotor_system.jl:
 
     julia> include("subsystems/rotor_system.jl")
     julia> include("control_allocator.jl")
@@ -578,6 +637,36 @@ function alloc_selftest()
     println("  Thrust R3–R6 mean  : $(round(lo_mean, digits=0)) N")
     println("  Hi/Lo ratio        : $(round(hi_mean / max(lo_mean,1e-6), digits=2))×  (expect ≈ 4×)")
     println("  $(ok7 ? "✓ PASS" : "✗ FAIL")")
+    println()
+
+    # ── Test 8: cruise-only rotors inactive in hover, active in cruise ────
+    # Configure R5/R6 as cruise-only pusher props (BETA-style).
+    # In hover (tilt=0): R5/R6 must be at omega_min with 0 kW.
+    # In cruise (tilt=85°): R5/R6 must be spinning above omega_min.
+    ap_beta = AllocatorParams(
+        lift_only_rotors      = (3, 4),
+        cruise_only_rotors    = (5, 6),
+        cruise_activation_tilt = deg2rad(45.0),
+        power_weights         = (630.0, 630.0, 280.0, 280.0, 280.0, 280.0)
+    )
+    # Hover: cruise-only rotors should be idle
+    rpms8h, kws8h = allocate_wrench(T_hov, 0.0, 0.0, 0.0, FLEET, 0.0, rho_sl, ap_beta)
+    cruise_idle_hover = all(rpms8h[i] ≈ ap_beta.omega_min for i in (5, 6))
+    cruise_kw_hover   = all(kws8h[i] == 0.0               for i in (5, 6))
+    # Cruise: cruise-only rotors should be active (above omega_min)
+    tilt_cr = deg2rad(85.0)
+    rpms8c, kws8c = allocate_wrench_vx(T_hov * 0.3, 0.0, 0.0, 0.0,
+                        FLEET, tilt_cr, 80.0, 300.0, ap_beta)
+    cruise_spinning   = all(rpms8c[i] > ap_beta.omega_min for i in (5, 6))
+    ok8 = cruise_idle_hover && cruise_kw_hover && cruise_spinning
+    push!(pass, ok8)
+    println("Test 8 — Cruise-only rotors R5/R6 mode:")
+    println("  Hover ω (rad/s) : ", round.(rpms8h, digits=1), "  (R5/R6 expect $(ap_beta.omega_min))")
+    println("  Hover kW        : ", round.(kws8h,  digits=1), "  (R5/R6 expect 0.0)")
+    println("  Cruise ω (rad/s): ", round.(rpms8c, digits=1), "  (R5/R6 expect > $(ap_beta.omega_min))")
+    println("  R5/R6 idle in hover : $(cruise_idle_hover && cruise_kw_hover ? "✓" : "✗")")
+    println("  R5/R6 active in cruise: $(cruise_spinning ? "✓" : "✗")")
+    println("  $(ok8 ? "✓ PASS" : "✗ FAIL")")
     println()
 
     println("=== $(count(pass))/$(length(pass)) tests passed ===\n")
