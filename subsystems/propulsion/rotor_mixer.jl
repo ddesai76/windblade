@@ -1,7 +1,7 @@
 # rotor_mixer.jl:     Wrench-to-RPM control allocator
 # AUTHOR:             DANIEL DESAI
 # UPDATED:            2026-06-29
-# VERSION:            0.1.4
+# VERSION:            0.1.5
 #
 # Post-solve mapping: takes the aggregate wrench demand from the flight
 # controller (total thrust + three moment demands) and distributes it
@@ -70,7 +70,7 @@
 #   rotor_system.jl        ← NO changes needed (all required fields exist)
 # =====================================================================
 
-using LinearAlgebra: pinv, Diagonal
+using LinearAlgebra: pinv, Diagonal, I
 using StaticArrays: SVector, SMatrix, MVector, MMatrix, @MVector
 
 # ── AllocatorParams ────────────────────────────────────────────────────
@@ -107,22 +107,22 @@ Base.@kwdef struct AllocatorParams
     # cruise rather than tilting out of the way.
     # These rotors are held at omega_min once tilt exceeds `lift_shutoff_tilt`
     # so the NNLS solver does not assign them spurious small thrust values.
-    # Defaults to an empty tuple for a fully-tilting all-rotor configuration.
+    # Set to an empty tuple for a fully-tilting all-rotor configuration.
     lift_only_rotors   :: Tuple{Vararg{Int}} = ()
-    lift_shutoff_tilt  :: Float64            = deg2rad(70.0)   # tilt at which hover rotors disengage
+    lift_shutoff_tilt  :: Float64            = deg2rad(70.0)   # ≈ 70° → shut down
 
     # Cruise-only rotors (e.g. fixed pusher props, BETA-style)
     # Rotors listed here are held at omega_min in hover and become active
     # once tilt reaches `cruise_activation_tilt`. Their B-matrix columns
-    # are zeroed below that threshold so the NNLS ignores them in hover - 
-    # set cruise_only_rotors = (5, 6) (or whichever indices
+    # are zeroed below that threshold so the NNLS ignores them in hover.
+    # In BETA mode: set cruise_only_rotors = (5, 6) (or whichever indices
     # are the pusher props) and tune cruise_activation_tilt to the tilt
     # angle at which those props reach useful efficiency. Overlap with
     # lift_shutoff_tilt is intentional — both rotor sets briefly active
     # during transition ensures no thrust deficit at handoff.
-    # Defauls to an empty tuple — all rotors tilt together.
+    # Default: empty tuple — all rotors tilt together (Joby/WINDBLADE mode).
     cruise_only_rotors     :: Tuple{Vararg{Int}} = ()
-    cruise_activation_tilt :: Float64            = deg2rad(45.0)   # tilt at which pusher rotors engage
+    cruise_activation_tilt :: Float64            = deg2rad(45.0)   # tilt at which pusher props engage
 
     # ── Per-rotor power-preference weights (Λp diagonal) ──────────────
     # Diagonal entries of Λp = diag(p₁,…,p₆), the column-weighting matrix
@@ -138,7 +138,14 @@ Base.@kwdef struct AllocatorParams
     # Equal weights reproduce the standard uniform NNLS behaviour.
     power_weights :: NTuple{6,Float64} = (1.0, 1.0, 1.0, 1.0, 1.0, 1.0)
 
-    # Autorotation model for windmilling lift-only rotors in cruise.
+    # Tikhonov regularisation for the NNLS solve (ε in ‖BΛpT_sub - w‖² + ε²‖T_sub‖²).
+    # Pulls the solution away from degenerate corners where the active-set solver
+    # flips rotors in/out between ODE steps, causing power spikes.
+    # Larger ε → smoother allocation, slightly less optimal wrench tracking.
+    # Smaller ε → more optimal but risks oscillation.
+    # Tune: start at 0.01 and increase if spikes persist; decrease if wrench
+    # error becomes visible. At ε=0.0 the pure unregularised NNLS is recovered.
+    eps_reg :: Float64 = 0.01
     #
     # A windmilling rotor in edgewise flow reaches an equilibrium speed where
     # aerodynamic driving torque (from the oncoming flow) balances profile drag.
@@ -176,12 +183,16 @@ Base.@kwdef struct AllocatorParams
     autorotate_Cp  :: Float64 = 0.05   # rotor power coefficient — drag-minimised autorotation
 end
 
-const ALLOC = AllocatorParams(power_weights = (280.0, 280.0, 280.0, 280.0, 280.0, 280.0))
+const ALLOC = AllocatorParams(power_weights = (1.0, 1.0, 1.0, 1.0, 1.0, 1.0))
 # power_weights are the Λp diagonal entries, set to rated shaft power (kW) per rotor class:
 #   R1/R2: TurboshaftEngine P_sl_W = 746 kW (1000 hp design point, powerplant.jl default)
 #   R3–R6: ElectricMotor P_max_W  = 280 kW (rotor_system.jl default)
 # Only ratios matter (allocator normalises internally); using rated kW directly
 # is self-documenting and survives rotor config changes without manual rescaling.
+#
+# lift_only_rotors = () → all 6 rotors active across the full tilt range.
+# Validated 2026-06-29: all-6-rotor allocation is stable and produces more
+# realistic SoC than the previous (3,4) windmill configuration.
 
 # ── Lift-rotor autorotation helpers ───────────────────────────────────
 """
@@ -303,7 +314,8 @@ Maps a 4-DOF wrench demand to per-rotor ω (rad/s) and electrical power (kW).
 Units match `rotor_rpm_each` and `rotor_kw_each` in rotor_system.jl.
 
 Solves:  T = arg min_{T ≥ 0} ‖BT - w‖_{Λp⁻²}
-via Lawson-Hanson NNLS after substitution T_sub = Λp⁻¹T.
+via Lawson-Hanson NNLS after substitution T_sub = Λp⁻¹T, with Tikhonov
+regularisation (ε = ap.eps_reg) to suppress inter-step corner-flipping.
 
 NOTE: kW computed here uses the hover induced-velocity estimate (vx=0).
 Use `allocate_wrench_vx` in the saving callback where vx is available.
@@ -320,13 +332,22 @@ function allocate_wrench(T_total::Float64,
     #    Substituting T_sub = Λp⁻¹T:
     #      min ‖T_sub‖₂  s.t.  (B·Λp)·T_sub = w, T_sub ≥ 0
     #    then recover  T = Λp · T_sub
+    #
+    #    Tikhonov regularisation augments the system to suppress corner-flipping:
+    #      [BΛp    ] T_sub ≈ [w]
+    #      [λ·I₆   ]         [0]
+    #    This adds a ‖T_sub‖² penalty pulling the solution toward the interior.
     B   = build_B(fleet, tilt_rad, ap)
     Λp  = Diagonal(SVector{6,Float64}(ap.power_weights))
     w   = SVector{4,Float64}(T_total, M_roll, M_pitch, M_yaw)
-    BΛp = B * Λp                                  # 4×6, weighted effectiveness matrix
+    BΛp = B * Λp                                        # 4×6, weighted effectiveness matrix
 
-    T_sub = nnls(BΛp, w)                          # solution in substituted space (T̃ = Λp⁻¹T)
-    T_vec = Λp * T_sub                            # recover physical thrust: T = Λp · T_sub
+    ε       = ap.eps_reg
+    A_reg   = SMatrix{10,6,Float64}(vcat(Matrix(BΛp), ε .* Matrix(I, 6, 6)))
+    b_reg   = SVector{10,Float64}(vcat(Vector(w), zeros(6)))
+
+    T_sub = nnls(A_reg, b_reg)                          # solution in substituted space (T̃ = Λp⁻¹T)
+    T_vec = Λp * T_sub                                  # recover physical thrust: T = Λp · T_sub
 
     # ── 2. Thrust → ω ─────────────────────────────────────────────────
     rpms = ntuple(6) do i
@@ -355,8 +376,8 @@ end
 # ── Lawson-Hanson NNLS ─────────────────────────────────────────────────────
 # Solves min ‖Ax - b‖₂  s.t.  x ≥ 0  for small (m×n) systems.
 # Ref: Lawson & Hanson, "Solving Least Squares Problems", 1974, Algorithm NNL.
-# At n=6 this is ~10 iterations worst-case; no allocations beyond the masks.
-function nnls(A::SMatrix{4,6,Float64}, b::SVector{4,Float64}) :: SVector{6,Float64}
+# Accepts any m×6 system — called with 4×6 (bare) or 10×6 (Tikhonov augmented).
+function nnls(A::SMatrix{m,6,Float64}, b::SVector{m,Float64}) :: SVector{6,Float64} where {m}
     n = 6
     x = @MVector zeros(Float64, 6)       # current solution (all passive)
     P = @MVector zeros(Bool, 6)          # true = active (free) set
@@ -647,7 +668,7 @@ function alloc_selftest()
         lift_only_rotors      = (3, 4),
         cruise_only_rotors    = (5, 6),
         cruise_activation_tilt = deg2rad(45.0),
-        power_weights         = (630.0, 630.0, 280.0, 280.0, 280.0, 280.0)
+        power_weights         = (746.0, 746.0, 280.0, 280.0, 280.0, 280.0)
     )
     # Hover: cruise-only rotors should be idle
     rpms8h, kws8h = allocate_wrench(T_hov, 0.0, 0.0, 0.0, FLEET, 0.0, rho_sl, ap_beta)
@@ -660,7 +681,7 @@ function alloc_selftest()
     cruise_spinning   = all(rpms8c[i] > ap_beta.omega_min for i in (5, 6))
     ok8 = cruise_idle_hover && cruise_kw_hover && cruise_spinning
     push!(pass, ok8)
-    println("Test 8 — Cruise-only rotors R5/R6 mode:")
+    println("Test 8 — Cruise-only rotors R5/R6 (BETA mode):")
     println("  Hover ω (rad/s) : ", round.(rpms8h, digits=1), "  (R5/R6 expect $(ap_beta.omega_min))")
     println("  Hover kW        : ", round.(kws8h,  digits=1), "  (R5/R6 expect 0.0)")
     println("  Cruise ω (rad/s): ", round.(rpms8c, digits=1), "  (R5/R6 expect > $(ap_beta.omega_min))")
