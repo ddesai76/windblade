@@ -95,11 +95,11 @@ Base.@kwdef struct AllocatorParams
     w_pitch  :: Float64 = 1.0
     w_yaw    :: Float64 = 0.5   # limited authority on fixed-pitch rotors
 
-    # ω limits (rad/s). S4-class: R≈1 m, ω_nom≈110 rad/s, tip ≈110 m/s.
+    # ω limits (rad/s): R≈1 m, ω_nom≈110 rad/s, tip ≈110 m/s.
     omega_min :: Float64 =  20.0   # flight-idle floor
     omega_max :: Float64 = 180.0   # structural / acoustic limit
 
-    # Lift-only rotor shutdown
+    # Lift-only rotors
     # Indices of rotors that provide lift only and do not produce thrust in
     # cruise. In the default configuration these are R3 and R4 (mid-L /
     # mid-R, arm_x=0). All six rotors share the same nacelle tilt angle —
@@ -109,20 +109,19 @@ Base.@kwdef struct AllocatorParams
     # so the NNLS solver does not assign them spurious small thrust values.
     # Set to an empty tuple for a fully-tilting all-rotor configuration.
     lift_only_rotors   :: Tuple{Vararg{Int}} = ()
-    lift_shutoff_tilt  :: Float64            = deg2rad(70.0)   # ≈ 70° → shut down
+    lift_shutoff_tilt  :: Float64            = deg2rad(70.0)   # tilt at which hover rotors disengage
 
-    # Cruise-only rotors (e.g. fixed pusher props, BETA-style)
+    # Cruise-only rotors
     # Rotors listed here are held at omega_min in hover and become active
     # once tilt reaches `cruise_activation_tilt`. Their B-matrix columns
     # are zeroed below that threshold so the NNLS ignores them in hover.
-    # In BETA mode: set cruise_only_rotors = (5, 6) (or whichever indices
-    # are the pusher props) and tune cruise_activation_tilt to the tilt
+    # Set cruise_only_rotors and tune cruise_activation_tilt to the tilt
     # angle at which those props reach useful efficiency. Overlap with
     # lift_shutoff_tilt is intentional — both rotor sets briefly active
     # during transition ensures no thrust deficit at handoff.
-    # Default: empty tuple — all rotors tilt together (Joby/WINDBLADE mode).
+    # Default: empty tuple — all rotors tilt together
     cruise_only_rotors     :: Tuple{Vararg{Int}} = ()
-    cruise_activation_tilt :: Float64            = deg2rad(45.0)   # tilt at which pusher props engage
+    cruise_activation_tilt :: Float64            = deg2rad(45.0)   # tilt at which pusher rotors engage
 
     # ── Per-rotor power-preference weights (Λp diagonal) ──────────────
     # Diagonal entries of Λp = diag(p₁,…,p₆), the column-weighting matrix
@@ -661,10 +660,10 @@ function alloc_selftest()
     println()
 
     # ── Test 8: cruise-only rotors inactive in hover, active in cruise ────
-    # Configure R5/R6 as cruise-only pusher props (BETA-style).
+    # Configure R5/R6 as cruise-only pusher rotors.
     # In hover (tilt=0): R5/R6 must be at omega_min with 0 kW.
     # In cruise (tilt=85°): R5/R6 must be spinning above omega_min.
-    ap_beta = AllocatorParams(
+    ap_cruise = AllocatorParams(
         lift_only_rotors      = (3, 4),
         cruise_only_rotors    = (5, 6),
         cruise_activation_tilt = deg2rad(45.0),
@@ -677,14 +676,14 @@ function alloc_selftest()
     # Cruise: cruise-only rotors should be active (above omega_min)
     tilt_cr = deg2rad(85.0)
     rpms8c, kws8c = allocate_wrench_vx(T_hov * 0.3, 0.0, 0.0, 0.0,
-                        FLEET, tilt_cr, 80.0, 300.0, ap_beta)
+                        FLEET, tilt_cr, 80.0, 300.0, ap_cruise)
     cruise_spinning   = all(rpms8c[i] > ap_beta.omega_min for i in (5, 6))
     ok8 = cruise_idle_hover && cruise_kw_hover && cruise_spinning
     push!(pass, ok8)
-    println("Test 8 — Cruise-only rotors R5/R6 (BETA mode):")
-    println("  Hover ω (rad/s) : ", round.(rpms8h, digits=1), "  (R5/R6 expect $(ap_beta.omega_min))")
+    println("Test 8 — Cruise-only rotors R5/R6:")
+    println("  Hover ω (rad/s) : ", round.(rpms8h, digits=1), "  (R5/R6 expect $(ap_cruise.omega_min))")
     println("  Hover kW        : ", round.(kws8h,  digits=1), "  (R5/R6 expect 0.0)")
-    println("  Cruise ω (rad/s): ", round.(rpms8c, digits=1), "  (R5/R6 expect > $(ap_beta.omega_min))")
+    println("  Cruise ω (rad/s): ", round.(rpms8c, digits=1), "  (R5/R6 expect > $(ap_cruise.omega_min))")
     println("  R5/R6 idle in hover : $(cruise_idle_hover && cruise_kw_hover ? "✓" : "✗")")
     println("  R5/R6 active in cruise: $(cruise_spinning ? "✓" : "✗")")
     println("  $(ok8 ? "✓ PASS" : "✗ FAIL")")
