@@ -4,7 +4,7 @@ Advanced Air Mobility Model-Based Prototyping
 
 ## Architecture
 
-WINDBLADE is a multi-language tiltrotor simulation stack. Each layer owns a distinct concern:
+WINDBLADE is a multi-language eVTOL simulation environment. Each language allocation owns a distinct concern:
 
 | Layer | Language | Role |
 |---|---|---|
@@ -188,7 +188,7 @@ Rotor geometry is defined in `subsystems/propulsion/rotor_config.csv`. Default c
 
 Edit `rotor_config.csv` and reload the Rotor Config tab in the GUI to apply changes without restart. A `turbine_electric` row requires fuel tank (`FuelTank`) and fuel chemistry (`FuelProperties`) parameters set in `fuel.jl`. `powerplant.jl` implements a `TurboshaftEngine` model (Gagg–Ferrar altitude lapse, derived SFC from thermal efficiency). Both files are loaded unconditionally by `rotor_system.jl` regardless of fleet composition.
 
-Edit 
+Edit `lift_only_rotors lift_shutoff_tilt cruise_only_rotors` and `cruise_activation_tilt` in `rotor_mixer.jl` to configure aircraft with lift-only and/or pusher rotors.
 
 ## Author
 
