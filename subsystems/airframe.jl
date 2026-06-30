@@ -1,7 +1,7 @@
 # airframe.jl:     Airframe and aerodynamics subsystem
 # AUTHOR:          DANIEL DESAI
-# UPDATED:         2026-06-17
-# VERSION:         0.1.1
+# UPDATED:         2026-06-30
+# VERSION:         0.1.2
 #
 #
 # Coordinate convention:
@@ -42,35 +42,35 @@ Base.@kwdef struct AirframeParams
                                                # Vcon_lo is computed from wing lift — no constant needed.
 end
 
-const AP = AirframeParams()
+const AIRFRAME = AirframeParams()
 
 const G        = 9.80665
 
 """
-    weight_N(ap::AirframeParams = AP) → N
+    weight_N(ap::AirframeParams = AIRFRAME) → N
 
 Aircraft weight in Newtons for the given AirframeParams instance.
 Use this instead of `WEIGHT_N` anywhere mass can vary at runtime (e.g.
 mission-variable fuel loading constructing a fresh `AirframeParams(mass_kg=...)`
 at launch) — `WEIGHT_N` below is a module-load-time snapshot of the
-*default* `AP.mass_kg` and does not update if a different `ap` is used.
+*default* `AIRFRAME.mass_kg` and does not update if a different `ap` is used.
 
 NOTE (2026-06-17): the mission-variable construction described above is
 not yet implemented anywhere in this codebase — mission_planner.jl has
 no mass_kg/fuel field, and nothing currently builds a non-default
-AirframeParams. AP.mass_kg is therefore always 2177.0 (the struct
+AirframeParams. AIRFRAME.mass_kg is therefore always 2177.0 (the struct
 default) regardless of mission. This function and the WEIGHT_N fix
 below are forward-looking: correct now, and correct once that wiring
 is added, but not yet exercised by any live mission-mass value. See
 the turbine-electric roadmap, Section 06 task list and AC-13.
 """
-weight_N(ap::AirframeParams = AP) = ap.mass_kg * G
+weight_N(ap::AirframeParams = AIRFRAME) = ap.mass_kg * G
 
 # Retained for backward compatibility with any existing caller that
 # references WEIGHT_N directly. New code, and any caller that needs to
 # reflect a non-default AirframeParams (e.g. mission-variable fuel load),
 # should call weight_N(ap) instead — see that function's docstring.
-const WEIGHT_N = weight_N(AP)
+const WEIGHT_N = weight_N(AIRFRAME)
 
 # ── Body / Fuselage Drag ──────────────────────────────────────────────
 
@@ -84,7 +84,7 @@ Uses vx_air * |vx_air| to preserve sign: positive vx_air (headwind)
 produces negative Fx (drag opposes motion). This form is also smooth
 at vx_air = 0, which matters for ForwardDiff.
 """
-function fuselage_drag(vx_air, alt, ap::AirframeParams=AP)
+function fuselage_drag(vx_air, alt, ap::AirframeParams=AIRFRAME)
     ρ = rho(alt)
     return 0.5 * ρ * ap.CD_body * ap.A_front_m2 * vx_air * abs(vx_air)
 end
@@ -103,7 +103,7 @@ end
     cl_from_alpha(alpha, ap) → dimensionless
 Linear lift curve with stall clamp.
 """
-function cl_from_alpha(alpha::Real, ap::AirframeParams=AP)
+function cl_from_alpha(alpha::Real, ap::AirframeParams=AIRFRAME)
     CL = ap.CL_alpha * (alpha - ap.alpha_0)
     return clamp(CL, ap.CL_min, ap.CL_max)
 end
@@ -124,7 +124,7 @@ end
     wing_lift(vx, pitch, tilt, alt, ap) → N
 Wing lift using AoA-dependent CL(α) with rotor downwash correction.
 """
-function wing_lift(vx, pitch, tilt, alt, ap::AirframeParams=AP)
+function wing_lift(vx, pitch, tilt, alt, ap::AirframeParams=AIRFRAME)
     ρ     = rho(alt)
     q     = 0.5 * ρ * max(vx, zero(vx))^2
     alpha = effective_alpha(pitch, tilt)
@@ -137,7 +137,7 @@ end
     wing_drag(vx, pitch, tilt, alt, ap) → N
 Total wing drag: zero-lift + induced drag using actual CL(α)².
 """
-function wing_drag(vx, pitch, tilt, alt, ap::AirframeParams=AP)
+function wing_drag(vx, pitch, tilt, alt, ap::AirframeParams=AIRFRAME)
     ρ     = rho(alt)
     q     = 0.5 * ρ * max(vx, 0.1)^2
     alpha = effective_alpha(pitch, tilt)
@@ -150,7 +150,7 @@ end
     back_transition_drag(vx, pitch_rad, tilt, alt, ap) → N
 Increased drag during back-transition from pitching manoeuvre.
 """
-function back_transition_drag(vx, pitch_rad, tilt, alt, ap::AirframeParams=AP)
+function back_transition_drag(vx, pitch_rad, tilt, alt, ap::AirframeParams=AIRFRAME)
     ρ      = rho(alt)
     q      = 0.5 * ρ * max(vx, 0.1)^2
     ge_d   = fw_ge_drag(alt, ap)
@@ -162,11 +162,11 @@ end
 
 # ── Wing Ground Effect ────────────────────────────────────────────────
 
-function fw_ge_lift(alt, ap::AirframeParams=AP)
+function fw_ge_lift(alt, ap::AirframeParams=AIRFRAME)
     return 1.0 + 0.10 * exp(-2.0 * max(alt, zero(alt)) / ap.wingspan_m)
 end
 
-function fw_ge_drag(alt, ap::AirframeParams=AP)
+function fw_ge_drag(alt, ap::AirframeParams=AIRFRAME)
     return 1.0 / fw_ge_lift(alt, ap)
 end
 
@@ -177,7 +177,7 @@ end
 Aerodynamic restoring moment opposing roll.
 Wire into fly.jl: du[8] += dihedral_roll_moment(...) / Ixx
 """
-function dihedral_roll_moment(roll, vx, alt, ap::AirframeParams=AP)
+function dihedral_roll_moment(roll, vx, alt, ap::AirframeParams=AIRFRAME)
     ρ = rho(alt)
     q = 0.5 * ρ * max(vx, zero(vx))^2
     return -ap.k_dihedral * roll * q * ap.wing_area_m2 * ap.wingspan_m
@@ -208,7 +208,7 @@ hover (tilt=0) it is 0.5, consistent with reduced wing effectiveness.
 
 ForwardDiff-safe: no Float64 coercions on state variables.
 """
-function wing_pitch_moment(vx, pitch, tilt, alt, ap::AirframeParams=AP)
+function wing_pitch_moment(vx, pitch, tilt, alt, ap::AirframeParams=AIRFRAME)
     ρ     = rho(alt)
     q     = 0.5 * ρ * max(vx, zero(vx))^2
     alpha = effective_alpha(pitch, tilt)
@@ -240,7 +240,7 @@ sufficient to halve the short-period oscillation amplitude per half-cycle.
 
 ForwardDiff-safe: no Float64 coercions on state-derived arguments.
 """
-function pitch_damping_moment(ωy, vx, tilt, alt, ap::AirframeParams=AP)
+function pitch_damping_moment(ωy, vx, tilt, alt, ap::AirframeParams=AIRFRAME)
     v = max(vx, zero(vx))
     v_safe = max(v, 0.5)            # avoid division by zero in hover
     ρ = rho(alt)
@@ -265,7 +265,7 @@ oppose the accumulated yaw drift within a few seconds of it developing.
 
 ForwardDiff-safe.
 """
-function yaw_damping_moment(ωz, vx, tilt, alt, ap::AirframeParams=AP)
+function yaw_damping_moment(ωz, vx, tilt, alt, ap::AirframeParams=AIRFRAME)
     v = max(vx, zero(vx))
     v_safe = max(v, 0.5)
     ρ = rho(alt)
@@ -335,7 +335,7 @@ future refinement could convert v[IDX.speed] to IAS using
 `v[IDX.speed] * sqrt(rho(alt) / 1.225)` before passing to draw_vcon!.
 """
 function vcon_limits(tilt_rad::Float64, alt_agl_m::Float64;
-                     ap::AirframeParams = AP,
+                     ap::AirframeParams = AIRFRAME,
                      weight_n::Float64  = weight_N(ap)) ::
          NamedTuple{(:lo_kmh, :hi_kmh), Tuple{Float64, Float64}}
 
