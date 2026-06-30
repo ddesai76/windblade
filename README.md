@@ -8,8 +8,8 @@ WINDBLADE is a multi-language tiltrotor simulation stack. Each layer owns a dist
 
 | Layer | Language | Role |
 |---|---|---|
-| Launcher / GUI | Python | Mission planner, browser UI, test runner |
-| Physics / ODE | Julia | BEM rotor model, state integrator, glass cockpit |
+| Launcher / GUI | Python | Browser-based mission planning UI, test runner |
+| Physics / ODE | Julia | Subsystem models, state integrator, glass cockpit UI|
 | Autopilot | C++ | Flight controller compiled to `autopilot.so` |
 | HOTAS input | C | Manual flight controls reader compiled to `controls/hotas` |
 
@@ -32,23 +32,23 @@ windblade/
 ├── planning/
 │   ├── mission_planner.jl              # Phase scheduler and timing constants
 │   ├── navigation.jl                   # Waypoint guidance and nav map state
-│   └── test_card.json                  # Source of truth for mission parameters
+│   └── test_card.json                  # Mission parameters
 │
 ├── subsystems/
 │   ├── airframe.jl                     # Aerodynamics and body forces
 │   ├── actuators.jl                    # Actuator model and PID tuning constants
 │   ├── battery_model.jl                # Equivalent-circuit battery and SoC model
-│   ├── landing_gear.jl                 # Three-point compliant strut contact model
+│   ├── landing_gear.jl                 # Three-point strut contact model
 │   └── propulsion/
 │       ├── blades.jl                   # Blade element momentum (BEM) implementation
-│       ├── powerplant.jl               # Motor/engine backends — electric, turboshaft
+│       ├── powerplant.jl               # Motor/engine backends (electric, turboshaft)
 │       ├── fuel.jl                     # Fuel chemistry and tank capacity
 │       ├── rotor_system.jl             # Powerplant top-level model
 │       ├── rotor_mixer.jl              # Wrench-to-RPM control allocator
 │       └── rotor_config.csv            # Per-rotor geometry and power parameters
 │
 └── world/
-    ├── atmosphere.jl                   # Troposphere ISA model (0–11000 m MSL)
+    ├── atmosphere.jl                   # Troposphere ISA model
     └── terrain.jl                      # Piecewise-linear ground-track elevation
 ```
 
@@ -190,4 +190,4 @@ Edit `rotor_config.csv` and reload the Rotor Config tab in the GUI to apply chan
 
 ## Author
 
-DANIEL DESAI — v0.1.1
+DANIEL DESAI — v0.1.2
