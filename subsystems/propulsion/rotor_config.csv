@@ -1,7 +1,7 @@
-rotor_id	R_m	n_blades	chord_m	twist_root_deg	twist_tip_deg	pitch_offset_deg	P_max_kW	rpm_hover	powerplant	notes
-1	1.45	5	0.175	16	6	4.4	280	960	electric	
-2	1.45	5	0.175	16	6	4.4	280	960	electric	
-3	1.45	5	0.175	16	6	4.4	280	960	electric	
-4	1.45	5	0.175	16	6	4.4	280	960	electric	
-5	1.45	5	0.175	16	6	4.4	280	960	electric	
-6	1.45	5	0.175	16	6	4.4	280	960	electric	
+rotor_id,R_m,n_blades,chord_m,twist_root_deg,twist_tip_deg,pitch_offset_deg,P_max_kW,rpm_hover,powerplant,notes
+1,1.45,5,0.175,16,6,4.4,280,960,electric,
+2,1.45,5,0.175,16,6,4.4,280,960,electric,
+3,1.45,5,0.175,16,6,4.4,280,960,electric,
+4,1.45,5,0.175,16,6,4.4,280,960,electric,
+5,1.45,5,0.175,16,6,4.4,280,960,electric,
+6,1.45,5,0.175,16,6,4.4,280,960,electric,
