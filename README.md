@@ -188,6 +188,8 @@ Rotor geometry is defined in `subsystems/propulsion/rotor_config.csv`. Default c
 
 Edit `rotor_config.csv` and reload the Rotor Config tab in the GUI to apply changes without restart. A `turbine_electric` row requires fuel tank (`FuelTank`) and fuel chemistry (`FuelProperties`) parameters set in `fuel.jl`. `powerplant.jl` implements a `TurboshaftEngine` model (Gagg–Ferrar altitude lapse, derived SFC from thermal efficiency). Both files are loaded unconditionally by `rotor_system.jl` regardless of fleet composition.
 
+Edit 
+
 ## Author
 
 DANIEL DESAI — v0.1.2
