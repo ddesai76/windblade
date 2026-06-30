@@ -3,7 +3,7 @@
 # windblade.py:   Mission Planner and Launcher GUI
 # AUTHOR:         DANIEL DESAI
 # UPDATED:        2026-06-22
-# VERSION:        0.1.4
+# VERSION:        0.1.3
 
 """
 Single-file entry point.  Run and a browser window opens with the
@@ -275,13 +275,13 @@ html,body{background:var(--bg);color:var(--nw);font-family:var(--mono);font-size
 
     <!-- Flight params -->
     <div class="panel" id="panel-flight">
-      <div class="sec">Cruise</div>
+      <div class="sec">Flight</div>
       <div style="display:grid;grid-template-columns:1fr 1fr 1fr 1fr 1fr;gap:20px;margin-bottom:18px">
-        <div class="field"><label>Speed (km/h)</label><input id="speed" value="300" oninput="sync()"></div>
-        <div class="field"><label>Altitude (ft MSL)</label><input id="alt" value="11500" oninput="sync()"></div>
-        <div class="field"><label>Hover alt AGL (m)</label><input id="hover" value="30" oninput="sync()"></div>
-        <div class="field"><label>Back-trans speed (m/s)</label><input id="bt-speed" value="50" oninput="sync()" title="fw_descent decelerates to this speed before pitching up"></div>
-        <div class="field"><label>Nacelle tilt (deg)</label><input id="nacelle-tilt" type="number" value="65" min="45" max="90" oninput="sync()" title="Cruise nacelle tilt angle — 45° (nose-down) to 90° (vertical)"></div>
+        <div class="field"><label>Cruise spd (km/h)</label><input id="speed" value="300" oninput="sync()"></div>
+        <div class="field"><label>Cruise alt (ft MSL)</label><input id="alt" value="11500" oninput="sync()"></div>
+        <div class="field"><label>Hover alt (m AGL)</label><input id="hover" value="30" oninput="sync()"></div>
+        <div class="field"><label>Trans2 spd (m/s)</label><input id="bt-speed" value="50" oninput="sync()" title="fw_descent decelerates to this speed before pitching up"></div>
+        <div class="field"><label>Nacelle tilt (deg)</label><input id="nacelle-tilt" value="70" min="45" max="90" oninput="sync()"></div>
       </div>
       <div class="sec">Turbulence (Dryden)</div>
       <div class="row2">
