@@ -169,7 +169,7 @@ Rotor geometry is defined in `subsystems/propulsion/rotor_config.csv`. Default c
 | Chord | 0.183 m |
 | Twist root/tip | 16° / 6° |
 | Pitch offset | 4.4° |
-| Max power | 630 kW per rotor |
+| Max power | 500 kW per rotor |
 | Hover RPM | 960 |
 | Powerplant | `turbine_electric` |
 
