@@ -1,7 +1,7 @@
 # fly.jl:         Advanced Air Mobility Tiltrotor Simulation
 # AUTHOR:         DANIEL DESAI
-# UPDATED:        2026-06-26
-# VERSION:        0.1.3
+# UPDATED:        2026-07-15
+# VERSION:        0.1.4
 #
 # Single entry point: loads subsystems, runs physics model, streams to glass_cockpit.jl
 #
@@ -12,11 +12,11 @@
 #   3  tilt        rotor tilt angle (rad)   0=hover, π/2=cruise
 #   4  dtilt       tilt rate (rad/s)
 #   5  pitch       pitch angle (rad)        positive=nose up
-#   6  dpitch      pitch rate (rad/s)       — driven by ωy (state 17)
+#   6  dpitch      pitch rate (rad/s)       — Euler equation state, tracks ωy
 #   7  roll        roll angle (rad)
-#   8  droll       roll rate (rad/s)        — driven by ωx (state 16)
+#   8  droll       roll rate (rad/s)        — Euler equation state, tracks ωx
 #   9  yaw         yaw angle (rad)
-#   10 dyaw        yaw rate (rad/s)         — driven by ωz (state 18)
+#   10 dyaw        yaw rate (rad/s)         — Euler equation state, tracks ωz
 #   11 thrust_lag  actual rotor thrust (N) — first-order spool lag (aggregate)
 #   12 soc         battery state of charge (0–1)
 #   13 τ           mission clock (s); negative = pre-hover
@@ -699,11 +699,26 @@ function build_ode(du, u, p, t)
     dx = vx * cos(yaw)
     dy = vx * sin(yaw)
 
+    # ── Euler angle kinematics ──────────────────────────────────────────
+    # Body-frame rates (ωx,ωy,ωz) → Euler angle rates (droll,dpitch,dyaw).
+    # Was previously dpitch=ωy, droll=ωx, dyaw=ωz — the zero-attitude limit
+    # of the transform below (sinφ→0, cosφ→1, tanθ→0). Correct at φ=θ=0
+    # only; with a ±45° roll limit and non-trivial pitch through the
+    # hover/cruise transition, the small-angle shortcut was inconsistent
+    # with the exact Euler's equations already used for dωx/dωy/dωz below.
+    # Singular at θ=±90° (gimbal lock) — not reached in this flight envelope.
+    sφ, cφ = sin(roll),  cos(roll)
+    cθ     = cos(pitch)
+    tθ     = tan(pitch)
+    droll_k  = ωx + sφ * tθ * ωy + cφ * tθ * ωz
+    dpitch_k = cφ * ωy - sφ * ωz
+    dyaw_k   = (sφ / cθ) * ωy + (cφ / cθ) * ωz
+
     du[1]=dvx;      du[2]=dalt
     du[3]=dtilt;    du[4]=ddtilt
-    du[5]=ωy;       du[6]=dωy
-    du[7]=ωx;       du[8]=dωx
-    du[9]=ωz;       du[10]=dωz
+    du[5]=dpitch_k; du[6]=dωy
+    du[7]=droll_k;  du[8]=dωx
+    du[9]=dyaw_k;   du[10]=dωz
     du[11]=dthrust; du[12]=dsoc;  du[13]=dτ
     du[14]=dx;      du[15]=dy
     du[16]=dωx;     du[17]=dωy;   du[18]=dωz
