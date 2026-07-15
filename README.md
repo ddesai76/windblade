@@ -83,7 +83,7 @@ The ODE integrates 22 states:
  
 States 19–22 added with Dryden turbulence (MIL-HDBK-1797B). The C++ autopilot interface receives states 1–18 + terrain AGL only — do not reorder.
  
-Attitude rates (states 6, 8, 10) are propagated using the full Euler angle kinematic transform from body-frame rates (`ωx, ωy, ωz` — states 16–18) as:
+Attitude rates (states 6, 8, 10) are propagated using the Euler angle kinematic transform from body-frame rates (`ωx, ωy, ωz` — states 16–18) as:
  
 ```
 φ̇ = ωx + sin(φ)tan(θ)ωy + cos(φ)tan(θ)ωz
