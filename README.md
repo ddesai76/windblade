@@ -53,9 +53,9 @@ windblade/
 ```
 
 ## State Vector
-
+ 
 The ODE integrates 22 states:
-
+ 
 | # | Symbol | Description | Units |
 |---|---|---|---|
 | 1 | `vx` | Forward speed | m/s |
@@ -80,8 +80,19 @@ The ODE integrates 22 states:
 | 20 | `turb_u` | Dryden longitudinal gust velocity | m/s |
 | 21 | `turb_v` | Dryden lateral gust velocity | m/s |
 | 22 | `turb_w` | Dryden vertical gust velocity | m/s |
-
+ 
 States 19–22 added with Dryden turbulence (MIL-HDBK-1797B). The C++ autopilot interface receives states 1–18 + terrain AGL only — do not reorder.
+ 
+Attitude rates (states 6, 8, 10) are propagated using the full Euler angle kinematic transform from body-frame rates (`ωx, ωy, ωz` — states 16–18) as:
+ 
+```
+φ̇ = ωx + sin(φ)tan(θ)ωy + cos(φ)tan(θ)ωz
+θ̇ = cos(φ)ωy − sin(φ)ωz
+ψ̇ = sin(φ)/cos(θ)·ωy + cos(φ)/cos(θ)·ωz
+```
+ 
+(φ=roll, θ=pitch, ψ=yaw)
+
 
 ## Dependencies
 
