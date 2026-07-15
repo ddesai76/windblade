@@ -131,9 +131,9 @@ function descent_initiation_range(tc)::Float64
     # forward thrust component (0.35×sin(65°) ≈ 0.32×weight) is enough to
     # mostly balance drag well above bt_entry_ms, so deceleration is far
     # slower than a naive thrust-deficit estimate suggests. Measured ~0.28
-    # m/s² average from an actual fw_descent run; using 0.23 m/s² here
+    # m/s² average from an actual fw_descent run; using 0.22 m/s² here
     # (slightly conservative, single-run measurement)
-    fw_desc_s    = (dash_ms - bt_entry_ms) / 0.23
+    fw_desc_s    = (dash_ms - bt_entry_ms) / 0.22
     fw_desc_dist = 0.5 * (dash_ms + bt_entry_ms) * fw_desc_s
 
     # back-transition leg: bt_entry_ms → 0 at half-speed average
