@@ -474,11 +474,10 @@ end
 # transition can be safely executed:
 #   Vcon_lo: minimum safe airspeed for tilt-forward — below this,
 #            wing lift is insufficient to support the aircraft as
-#            rotor thrust vectors forward. S4-class ≈ 80 km/h.
+#            rotor thrust vectors forward ≈ 75 km/h.
 #   Vcon_hi: maximum safe airspeed in rotor-borne flight — above this,
 #            aerodynamic loads on tilted rotors exceed structural limits
-#            and rotor RPM authority is insufficient for attitude control.
-#            S4-class ≈ 165 km/h.
+#            and rotor RPM authority is insufficient for attitude control ≈ 200 km/h.
 #
 # Status logic (driven by tilt angle and speed):
 #   CRUISE  (tilt > 80°) — corridor not applicable; show dim
@@ -604,12 +603,7 @@ function draw_contact!(ax, contact::Bool, strut_load_n::Float64,
 end
 
 # Powerplant status panel — SOC, Battery Temp, and (turbine/turbine-electric
-# fleets only) Fuel. Aggregate power_kw is intentionally NOT shown here: it's
-# just the sum of the per-rotor kW values already displayed in the rotor
-# gauge strip below, so a 4th readout here would be redundant. The FUEL row
-# only appears when show_fuel is true (see has_turbine() in launch_cockpit);
-# all-electric fleets get the original 2-row panel with the third slot left
-# empty rather than a wasted standalone gauge/column.
+# fleets only) Fuel. The FUEL row only appears when show_fuel is true (see has_turbine() in launch_cockpit);
 function draw_power!(ax, soc_pct, batt_temp_c, fuel_kg, fuel_capacity_kg;
                      show_fuel::Bool=false)
     empty!(ax)
@@ -866,7 +860,7 @@ function draw_nav_map!(ax, snap)
         scatter!(ax, [org_ndc], color=TH.panel, markersize=9,
                  strokecolor=TH.green, strokewidth=1.5)
         text!(ax, org_ndc[1] + 0.03, org_ndc[2] + 0.03,
-              text="TKOF", fontsize=7, color=TH.green,
+              text=ATM.airport_icao, fontsize=11, color=TH.green,
               align=(:left, :bottom), font=LABEL_FONT)
     end
 
@@ -884,7 +878,7 @@ function draw_nav_map!(ax, snap)
         poly!(ax, diamond[1:end-1],
               color=RGBAf(wp_col.r, wp_col.g, wp_col.b, 0.18), strokewidth=0)
         text!(ax, wp_ndc[1] + 0.04, wp_ndc[2] + 0.04,
-              text=wp_label, fontsize=7, color=wp_col,
+              text=wp_label, fontsize=11, color=wp_col,
               align=(:left, :bottom), font=LABEL_FONT)
     end
 
@@ -936,7 +930,7 @@ function draw_nav_map!(ax, snap)
 
     # BRG small label (upper left)
     text!(ax, -0.96, -0.56,
-          text="BRG", fontsize=10, color=TH.text_dim,
+          text="BRG", fontsize=11, color=TH.text_dim,
           align=(:left, :center), font=LABEL_FONT)
     text!(ax, -0.96, -0.67,
           text=brg_str, fontsize=22, color=wp_col,
@@ -944,7 +938,7 @@ function draw_nav_map!(ax, snap)
 
     # RNG — large (lower left)
     text!(ax, -0.96, -0.83,
-          text="RNG", fontsize=10, color=TH.text_label,
+          text="RNG", fontsize=11, color=TH.text_label,
           align=(:left, :center), font=LABEL_FONT)
     text!(ax, -0.96, -0.94,
           text=rng_str, fontsize=22, color=wp_col,
