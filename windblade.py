@@ -2,16 +2,16 @@
 #
 # windblade.py:   Mission Planner and Launcher GUI
 # AUTHOR:         DANIEL DESAI
-# UPDATED:        2026-06-22
-# VERSION:        0.1.3
+# UPDATED:        2026-07-16
+# VERSION:        0.1.4
 
 """
 Single-file entry point.  Run and a browser window opens with the
-mission planner GUI.  Fill in the form, click Launch — the script
-passes weather (raw METARs) and cruise params directly to test_flight.py
-via CLI args, reads subsystems/propulsion/rotor_config.csv for the rotor
+mission planner GUI.  Fill in the form and Launch — the script
+passes weather (METARs) and cruise parameters directly to test_flight.py
+as CLI args, reads subsystems/propulsion/rotor_config.csv for the rotor
 fleet, injects overrides into test_card.json after planning, then runs
-the sim. No planning/ files are written or restored and test_flight.py is never modified.
+the sim. 
 
 Usage
 -----
@@ -40,6 +40,7 @@ import argparse
 import csv as csv_mod
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -104,6 +105,22 @@ def _patch_test_card(card_path: Path, overrides: list) -> None:
     card.setdefault("rotor_fleet", {})["overrides"] = overrides
     card_path.write_text(json.dumps(card, indent=2))
 
+# Wind group in a METAR: dddss[Ggmax]KT|MPS|KMH  (ddd or VRB, ss = sustained speed)
+_METAR_WIND_RE = re.compile(r'\b(?:\d{3}|VRB)(\d{2,3})(?:G\d{2,3})?(KT|MPS|KMH)\b')
+
+def _metar_wind_speed_ms(metar: str) -> float:
+    """Sustained wind speed in m/s parsed from a raw METAR string, or 0.0 if none found."""
+    if not metar:
+        return 0.0
+    m = _METAR_WIND_RE.search(metar.upper())
+    if not m:
+        return 0.0
+    speed, unit = float(m.group(1)), m.group(2)
+    if unit == "KT":  return speed * 0.514444
+    if unit == "MPS": return speed
+    if unit == "KMH": return speed / 3.6
+    return 0.0
+
 def _build_argv(sim: dict, out_dir: Path,
                 dep_metar: str = "", arr_metar: str = "",
                 cru: dict = {}) -> list[str]:
@@ -128,8 +145,145 @@ def _build_argv(sim: dict, out_dir: Path,
     if cru.get("hover_alt_m"):          argv += ["--hover-m",            str(cru["hover_alt_m"])]
     if cru.get("back_trans_speed_ms"):  argv += ["--bt-speed-ms",        str(cru["back_trans_speed_ms"])]
     if cru.get("nacelle_tilt_deg"):     argv += ["--nacelle-tilt-deg",   str(cru["nacelle_tilt_deg"])]
-    if cru.get("turbulence_intensity"): argv += ["--turb-intensity",      str(cru["turbulence_intensity"])]
+    if sim.get("turb"):
+        turb_intensity = round(0.1 * _metar_wind_speed_ms(dep_metar), 3)
+        if turb_intensity > 0:
+            argv += ["--turb-intensity", str(turb_intensity)]
     return argv
+
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+#  Results plotting  (ported from plot_test_flight.py — kept inline so
+#  windblade.py stays a single-file entry point; see module docstring)
+# ═════════════════════════════════════════════════════════════════════════════
+
+# Default columns rendered to the Last Results tab after every run —
+# overridable per-run from the Parameters tab (Plots section).
+DEFAULT_PLOT_COLUMNS = ["altitude_msl_ft", "speed_kmh"]
+
+# Friendly axis labels for common telemetry columns; anything else falls
+# back to a title-cased version of the raw column name.
+_PLOT_LABELS = {
+    "altitude_msl_ft": "Altitude (ft MSL)",
+    "speed_kmh":        "Speed (km/h)",
+    "power_kw":         "Power (kW)",
+    "soc_pct":          "State of Charge (%)",
+    "gz":               "Vertical load factor (gz)",
+}
+
+_PLOT_PHASE_COLORS = {
+    "hover": "#02CCFE", "transition": "#fb9f3a", "fw_climb": "#de3163",
+    "dash": "#2C75FF", "fw_descent": "#9c179e", "back_transition": "#fb9f3a",
+    "descent": "#02CCFE", "landed": "#179236"
+}
+_PLOT_THEME = dict(
+    bg=(0.06, 0.06, 0.10), panel=(0.10, 0.10, 0.16),
+    grid=(1.0, 1.0, 1.0, 0.07), tick=(0.55, 0.55, 0.65),
+    label=(0.85, 0.85, 0.95), title=(0.95, 0.95, 1.00),
+    line_fallback="#02CCFE",
+)
+
+def _plot_label(col: str) -> str:
+    return _PLOT_LABELS.get(col) or (col.replace("_", " ").strip().title() or col)
+
+def _load_flight_csv(csv_path: Path):
+    import pandas as pd
+    df = pd.read_csv(csv_path, skipinitialspace=True)
+    df.columns = df.columns.str.strip()
+    if "phase" in df.columns:
+        df["phase"] = (df["phase"].astype(str).str.strip().str.lower()
+                        .str.replace(r"^autoland:", "", regex=True))
+    return df
+
+def _make_flight_plot(df, y_col: str, y_label: str, out_path: Path) -> None:
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    import matplotlib.lines as mlines
+
+    th, x_col = _PLOT_THEME, "timestamp_s"
+    fig, ax = plt.subplots(figsize=(12, 6), facecolor=th["bg"])
+    ax.set_facecolor(th["panel"])
+
+    if "phase" in df.columns:
+        present = [ph for ph in _PLOT_PHASE_COLORS if (df["phase"] == ph).any()]
+        for ph in present:
+            mask = df["phase"] == ph
+            ax.plot(df.loc[mask, x_col], df.loc[mask, y_col],
+                    color=_PLOT_PHASE_COLORS.get(ph, "#ffffff"), lw=2.2)
+        color_groups: dict[str, list[str]] = {}
+        for ph in present:
+            color_groups.setdefault(_PLOT_PHASE_COLORS.get(ph, "#ffffff"), []).append(ph)
+        handles = [mlines.Line2D([], [], color=c, linewidth=4, label=" & ".join(phs))
+                   for c, phs in color_groups.items()]
+        if handles:
+            ax.legend(handles=handles, loc="best", frameon=True, framealpha=0.10,
+                       facecolor=th["panel"], edgecolor=(0.5, 0.5, 0.5, 0.3),
+                       labelcolor=th["label"], fontsize=9)
+    else:
+        ax.plot(df[x_col], df[y_col], color=th["line_fallback"], lw=2.2)
+
+    ax.set_title(y_label, color=th["title"], fontsize=13)
+    ax.set_xlabel("time (s)", color=th["label"], fontsize=11)
+    ax.set_ylabel(y_label, color=th["label"], fontsize=11)
+    ax.tick_params(colors=th["tick"], labelsize=9)
+    for s in ax.spines.values():
+        s.set_visible(False)
+    ax.grid(True, color=th["grid"], linewidth=0.8, linestyle=(0, (1, 3)))
+
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=200, bbox_inches="tight", facecolor=th["bg"])
+    plt.close(fig)
+
+def _generate_plots(df, out_dir: Path, columns: list[str]) -> dict[str, str]:
+    """Render PNGs for the requested columns into out_dir.
+    Returns {column: filename} for whichever columns were present."""
+    if "timestamp_s" not in df.columns:
+        return {}
+    plots = {}
+    for col in columns:
+        if not col or col not in df.columns:
+            continue
+        fname = f"plot_{col}.png"
+        try:
+            _make_flight_plot(df, col, _plot_label(col), out_dir / fname)
+            plots[col] = fname
+        except Exception as e:
+            warn(f"plot generation failed for {col}: {e}")
+
+    return plots
+
+def _compute_flight_metrics(df) -> dict:
+    """Summary stats parsed straight from the same results CSV used for the
+    plots: flight time, range from origin, energy used, arrival SoC."""
+    m: dict = {}
+    if "timestamp_s" in df.columns and len(df):
+        m["flight_time_s"] = round(float(df["timestamp_s"].max()), 1)
+    if "x_m" in df.columns and "y_m" in df.columns and len(df):
+        x_m = abs(float(df["x_m"].iloc[-1]))
+        y_m = abs(float(df["y_m"].iloc[-1]))
+        m["distance_km"] = round(((x_m ** 2 + y_m ** 2) ** 0.5) / 1000.0, 2)
+    if "power_kw" in df.columns and "timestamp_s" in df.columns and len(df) > 1:
+        import numpy as np
+        t = df["timestamp_s"].to_numpy(dtype=float)
+        p = df["power_kw"].to_numpy(dtype=float)
+        energy_kj = float(np.sum(np.diff(t) * (p[:-1] + p[1:]) / 2.0))  # kW·s = kJ
+        m["energy_mj"] = round(energy_kj / 1000.0, 2)
+    if "soc_pct" in df.columns and len(df):
+        m["arrival_soc_pct"] = round(float(df["soc_pct"].iloc[-1]), 1)
+    return m
+
+def _process_results_csv(csv_path: Path, out_dir: Path,
+                          columns: list[str]) -> tuple[dict, dict]:
+    """Load csv_path once; render plots for `columns` and compute summary
+    metrics from the same DataFrame. Returns (plots, metrics)."""
+    try:
+        df = _load_flight_csv(csv_path)
+    except Exception as e:
+        warn(f"could not read {csv_path.name} for plotting: {e}")
+        return {}, {}
+    return _generate_plots(df, out_dir, columns), _compute_flight_metrics(df)
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -234,7 +388,7 @@ html,body{background:var(--bg);color:var(--nw);font-family:var(--mono);font-size
     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M3 12h18M3 6l9-3 9 3M3 18l9 3 9-3"/></svg>Route &amp; weather
   </div>
   <div class="nav-item" onclick="nav('flight',this)">
-    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M12 2l2 7h7l-5.5 4 2 7L12 16l-5.5 4 2-7L3 9h7z"/></svg>Flight params
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M12 2l2 7h7l-5.5 4 2 7L12 16l-5.5 4 2-7L3 9h7z"/></svg>Parameters
   </div>
   <div class="sb-sec">Propulsion</div>
   <div class="nav-item" onclick="nav('rotors',this);loadRotors()">
@@ -277,15 +431,11 @@ html,body{background:var(--bg);color:var(--nw);font-family:var(--mono);font-size
     <div class="panel" id="panel-flight">
       <div class="sec">Flight</div>
       <div style="display:grid;grid-template-columns:1fr 1fr 1fr 1fr 1fr;gap:20px;margin-bottom:18px">
-        <div class="field"><label>Cruise spd (km/h)</label><input id="speed" value="300" oninput="sync()"></div>
-        <div class="field"><label>Cruise alt (ft MSL)</label><input id="alt" value="11500" oninput="sync()"></div>
+        <div class="field"><label>Cruise spd (km/h)</label><input id="speed" value="296" oninput="sync()"></div>
+        <div class="field"><label>Cruise alt (ft MSL)</label><input id="alt" value="11000" oninput="sync()"></div>
         <div class="field"><label>Hover alt (m AGL)</label><input id="hover" value="30" oninput="sync()"></div>
         <div class="field"><label>Trans2 spd (m/s)</label><input id="bt-speed" value="50" oninput="sync()" title="fw_descent decelerates to this speed before pitching up"></div>
         <div class="field"><label>Nacelle tilt (deg)</label><input id="nacelle-tilt" value="70" min="45" max="90" oninput="sync()"></div>
-      </div>
-      <div class="sec">Turbulence (Dryden)</div>
-      <div class="row2">
-        <div class="field"><label>Intensity σ (m/s)</label><input id="turb-intensity" value="0" oninput="sync()" title="0=off  1.5=light  3.0=moderate  6.0=severe"></div>
       </div>
       <div class="sec">Execution</div>
       <div class="row2">
@@ -306,7 +456,21 @@ html,body{background:var(--bg);color:var(--nw);font-family:var(--mono);font-size
         </div>
       </div>
 
+      <div class="sec">Plots</div>
+      <div class="row2">
+        <div class="field"><label>Plot column 1</label><input id="plot-col1" value="altitude_msl_ft" oninput="sync()" title="CSV column name to render as a PNG in the Last Results tab"></div>
+        <div class="field"><label>Plot column 2</label><input id="plot-col2" value="speed_kmh" oninput="sync()" title="CSV column name to render as a PNG in the Last Results tab"></div>
+      </div>
+
       <div class="sec">Options</div>
+      <div class="toggle-row">
+        <div><div class="tl">Show glass cockpit</div><div class="ts">Auto mode only; not compatible with speed factor</div></div>
+        <div class="switch" id="sw-gui" onclick="tog(this,'gui')"></div>
+      </div>
+      <div class="toggle-row">
+        <div><div class="tl">Dryden turbulence</div><div class="ts">Approximated as 0.1 x reference wind speed</div></div>
+        <div class="switch" id="sw-turb" onclick="tog(this,'turb')"></div>
+      </div>
       <div class="toggle-row">
         <div><div class="tl">Download SRTM terrain</div><div class="ts">Force terrain profile refresh for this route</div></div>
         <div class="switch" id="sw-terrain" onclick="tog(this,'terrain')"></div>
@@ -318,10 +482,6 @@ html,body{background:var(--bg);color:var(--nw);font-family:var(--mono);font-size
       <div class="toggle-row">
         <div><div class="tl">Skip planning</div><div class="ts">Reuse existing test_card.json</div></div>
         <div class="switch" id="sw-noplan" onclick="tog(this,'noplan')"></div>
-      </div>
-      <div class="toggle-row">
-        <div><div class="tl">Show glass cockpit</div><div class="ts">Auto mode only; not compatible with speed factor</div></div>
-        <div class="switch" id="sw-gui" onclick="tog(this,'gui')"></div>
       </div>
       <div class="toggle-row">
         <div><div class="tl">Export SQLite DB</div><div class="ts">Write dash_results_&lt;ts&gt;.db alongside the CSV (test_parameters + telemetry tables)</div></div>
@@ -357,13 +517,14 @@ html,body{background:var(--bg);color:var(--nw);font-family:var(--mono);font-size
     <!-- Results -->
     <div class="panel" id="panel-results">
       <div class="metric-row">
-        <div class="metric"><div class="val" id="rv-offset">—</div><div class="lbl">Landing offset</div><div class="sub" id="rv-offset-s">no run yet</div></div>
-        <div class="metric"><div class="val" id="rv-gz">—</div><div class="lbl">Touchdown gz</div><div class="sub" id="rv-gz-s">no run yet</div></div>
-        <div class="metric"><div class="val" id="rv-soc">—</div><div class="lbl">Arrival SoC</div><div class="sub" id="rv-soc-s">no run yet</div></div>
-        <div class="metric"><div class="val" id="rv-phases">—</div><div class="lbl">Phases logged</div><div class="sub" id="rv-phases-s">no run yet</div></div>
+        <div class="metric"><div class="val" id="rv-time">—</div><div class="lbl">Flight time</div></div>
+        <div class="metric"><div class="val" id="rv-dist">—</div><div class="lbl">Distance flown</div></div>
+        <div class="metric"><div class="val" id="rv-energy">—</div><div class="lbl">Energy</div></div>
+        <div class="metric"><div class="val" id="rv-soc">—</div><div class="lbl">Arrival SoC</div></div>
       </div>
       <div class="callout">Drop a <code>dash_results_*.csv</code> to analyse, or results populate automatically after a run.</div>
       <div class="callout" id="db-status" style="display:none;border-color:var(--ga)">&#10003; SQLite DB exported alongside CSV</div>
+      <div id="auto-plots"></div>
       <div style="border:1px dashed var(--stroke-hi);border-radius:2px;padding:28px;text-align:center;cursor:pointer;background:var(--panel);margin-bottom:16px" onclick="document.getElementById('res-file').click()">
         <input type="file" id="res-file" accept=".csv" style="display:none" onchange="loadResults(this.files[0])">
         <p style="font-size:22px;color:var(--dim)">Drop results CSV or click to browse</p>
@@ -380,7 +541,7 @@ html,body{background:var(--bg);color:var(--nw);font-family:var(--mono);font-size
 </div>
 
 <script>
-var sw={terrain:false,nobuild:false,noplan:false,gui:false,db:false};
+var sw={terrain:false,nobuild:false,noplan:false,gui:false,db:false,turb:false};
 var running=false;
 var rotorData=[];
 
@@ -393,6 +554,7 @@ function nav(id,el){
   document.getElementById('panel-'+id).classList.add('active');
   if(el)el.classList.add('active');
   if(id==='launch')renderChecklist();
+  if(id==='results')loadAutoPlots();
 }
 
 function tog(el,key){
@@ -600,9 +762,10 @@ function getConfig(){
   return{
     dep_metar: v('dep-metar'),
     arr_metar: v('arr-metar'),
-    cruise:{speed_kmh:parseFloat(v('speed'))||300,altitude_ft:parseFloat(v('alt'))||11500,hover_alt_m:parseFloat(v('hover'))||30,back_trans_speed_ms:parseFloat(v('bt-speed'))||50,nacelle_tilt_deg:Math.min(90,Math.max(45,parseFloat(v('nacelle-tilt'))||65)),turbulence_intensity:parseFloat(v('turb-intensity'))||0},
+    cruise:{speed_kmh:parseFloat(v('speed'))||296,altitude_ft:parseFloat(v('alt'))||11000,hover_alt_m:parseFloat(v('hover'))||30,back_trans_speed_ms:parseFloat(v('bt-speed'))||50,nacelle_tilt_deg:Math.min(90,Math.max(45,parseFloat(v('nacelle-tilt'))||65))},
     sim:{mode:v('mode'),speed_factor:parseInt(v('sfactor'))||1,
-         terrain:sw.terrain,no_build:sw.nobuild,no_plan:sw.noplan,gui:sw.gui,db:sw.db},
+         terrain:sw.terrain,no_build:sw.nobuild,no_plan:sw.noplan,gui:sw.gui,db:sw.db,turb:sw.turb},
+    plot_columns:[v('plot-col1')||'altitude_msl_ft', v('plot-col2')||'speed_kmh'],
 
   };
 }
@@ -647,7 +810,7 @@ function pollLog(offset){
         logLine(rc===0?'\n<span class="ga">&#9552;&#9552;&#9552;  complete  rc=0  &#9552;&#9552;&#9552;</span>':'\n<span class="rd">&#9552;&#9552;&#9552;  exited  rc='+rc+'  &#9552;&#9552;&#9552;</span>');
         document.getElementById('statusbar').textContent='last run: rc='+rc;
         resetLaunch();
-        if(rc<=1)nav('results',document.querySelectorAll('.nav-item')[4]);
+        if(rc<=1){nav('results',document.querySelectorAll('.nav-item')[4]);}
       } else {
         setTimeout(()=>pollLog(d.next_offset),800);
       }
@@ -656,6 +819,34 @@ function pollLog(offset){
 }
 
 function resetLaunch(){running=false;document.getElementById('btn-launch').disabled=false;}
+
+function fmtMinSec(totalSeconds){
+  var s=Math.round(totalSeconds), mm=Math.floor(s/60), ss=s%60;
+  return mm+'m '+ss+'s';
+}
+
+function loadAutoPlots(){
+  fetch('/plots').then(r=>r.json()).then(d=>{
+    var m=d.metrics||{};
+    document.getElementById('rv-time').textContent   = m.flight_time_s!=null ? fmtMinSec(m.flight_time_s) : '—';
+    document.getElementById('rv-dist').textContent    = m.distance_km!=null ? m.distance_km.toFixed(2)+' km' : '—';
+    document.getElementById('rv-energy').textContent  = m.energy_mj!=null ? m.energy_mj.toFixed(2)+' MJ' : '—';
+    document.getElementById('rv-soc').textContent     = m.arrival_soc_pct!=null ? m.arrival_soc_pct.toFixed(1)+'%' : '—';
+
+    var el=document.getElementById('auto-plots');
+    if(!el)return;
+    if(!d.plots||!d.plots.length){el.innerHTML='';return;}
+    el.innerHTML='<div class="sec">Flight plots</div>'
+      +'<div style="display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-bottom:16px">'
+      +d.plots.map(function(p){
+        var src=p.url+'?t='+Date.now();
+        return '<div><a href="'+p.url+'" download title="Click to save PNG">'
+          +'<img src="'+src+'" alt="'+p.col+'" style="width:100%;display:block;border:1px solid var(--stroke-hi);border-radius:2px"></a>'
+          +'<div style="font-size:16px;color:var(--dim);margin-top:4px;text-align:center">'+p.col+' &middot; click to save PNG</div></div>';
+      }).join('')
+      +'</div>';
+  }).catch(function(){});
+}
 
 function loadResults(f){
   if(!f)return;
@@ -666,13 +857,8 @@ function loadResults(f){
     var rows=lines.slice(1).map(l=>l.split(',').map(s=>s.trim()));
     var ci=k=>hdr.indexOf(k);
 
-    // Offset = distance from first gear-contact position to target waypoint.
-    // Target coords come from test_card.json via /card endpoint.
     var phases={};
-    var lastGz=0,lastSoc=0,gcX=null,gcY=null;
-    var tgtX=0,tgtY=0;  // will be overwritten by /card fetch
-    var prevGc=0, rowNum=0;
-
+    var rowNum=0;
     rows.forEach(r=>{
       rowNum++;
       var ph=ci('phase')>=0?r[ci('phase')]:'';
@@ -681,50 +867,12 @@ function loadResults(f){
         phases[ph].last=rowNum;
         phases[ph].n++;
       }
-      if(ci('gz')>=0)lastGz=parseFloat(r[ci('gz')])||lastGz;
-      if(ci('soc_pct')>=0)lastSoc=parseFloat(r[ci('soc_pct')])||lastSoc;
-      // Capture position at first gear contact (touchdown)
-      var gc=ci('gear_contact')>=0?parseFloat(r[ci('gear_contact')])||0:0;
-      if(gc===1&&prevGc===0&&gcX===null){
-        gcX=ci('x_m')>=0?parseFloat(r[ci('x_m')])||0:0;
-        gcY=ci('y_m')>=0?parseFloat(r[ci('y_m')])||0:0;
-      }
-      prevGc=gc;
     });
 
-    // If no gear contact found, use last row position
-    if(gcX===null){
-      var last=rows[rows.length-1];
-      gcX=ci('x_m')>=0?parseFloat(last[ci('x_m')])||0:0;
-      gcY=ci('y_m')>=0?parseFloat(last[ci('y_m')])||0:0;
-    }
-
-    // Fetch target coords from test_card.json, then render
-    function renderResults(tx,ty){
-      var dx=gcX-tx, dy=gcY-ty;
-      var offset=Math.sqrt(dx*dx+dy*dy);
-      set('rv-offset',offset.toFixed(0)+' m','rv-offset-s',offset<50?'c-ok':offset<500?'c-warn':'c-fail',offset<50?'within limit':offset<500?'elevated':'needs fix');
-      set('rv-gz',lastGz?lastGz.toFixed(2)+'g':'—','rv-gz-s',lastGz<1.5?'c-ok':lastGz<2.5?'c-warn':'c-fail',lastGz<1.5?'< 1.5g':lastGz<2.5?'high':'hard landing');
-      set('rv-soc',lastSoc?lastSoc.toFixed(1)+'%':'—','rv-soc-s',lastSoc>20?'c-ok':'c-fail',lastSoc>20?'> 20% reserve':'low reserve');
-      var nph=Object.keys(phases).length;
-      set('rv-phases',nph||'—','rv-phases-s',nph?'c-ok':'','');
-      document.getElementById('phase-tbody').innerHTML=Object.entries(phases).map(([ph,v])=>
-        '<tr><td>'+ph+'</td><td>'+v.last+'</td><td>'+v.n+'</td></tr>').join('');
-      document.getElementById('results-detail').style.display='block';
-    }
-    fetch('/card')
-      .then(r=>r.json())
-      .then(card=>{
-        var nav=card.navigation||{};
-        var tgt=nav.target||{};
-        renderResults(parseFloat(tgt.x_m)||0, parseFloat(tgt.y_m)||0);
-      })
-      .catch(()=>renderResults(0,0));
+    document.getElementById('phase-tbody').innerHTML=Object.entries(phases).map(([ph,v])=>
+      '<tr><td>'+ph+'</td><td>'+v.last+'</td><td>'+v.n+'</td></tr>').join('');
+    document.getElementById('results-detail').style.display='block';
   };r.readAsText(f);
-}
-function set(vid,val,sid,cls,sub){
-  document.getElementById(vid).textContent=val;
-  var s=document.getElementById(sid);s.textContent=sub;s.className='sub '+cls;
 }
 
 loadRotors();
@@ -743,6 +891,10 @@ _sim_done: bool      = False
 _sim_rc:   int       = -1
 _sim_lock  = threading.Lock()
 
+_last_out_dir: Path | None = None
+_last_plots:   dict[str, str] = {}   # {column: filename}, relative to _last_out_dir
+_last_metrics: dict = {}             # flight_time_s / distance_km / energy_mj / arrival_soc_pct
+
 def _run_sim(cfg: dict) -> None:
     global _sim_done, _sim_rc
 
@@ -755,6 +907,9 @@ def _run_sim(cfg: dict) -> None:
     arr_metar = cfg.get("arr_metar", "").strip()
     cru       = cfg.get("cruise", {})
     sim       = cfg.get("sim",    {})
+    plot_cols = [c.strip() for c in (cfg.get("plot_columns") or []) if c and c.strip()]
+    if not plot_cols:
+        plot_cols = list(DEFAULT_PLOT_COLUMNS)
     out_dir   = (ROOT / f"results_{datetime.now(UTC).strftime('%Y%m%d_%H%M%S')}").resolve()
 
     ovrs = read_rotor_csv()
@@ -765,6 +920,10 @@ def _run_sim(cfg: dict) -> None:
         argv = _build_argv(sim, out_dir, dep_metar, arr_metar, cru)
         _log(f"[INFO]  DEP: {dep_metar[:70]}")
         _log(f"[INFO]  ARR: {arr_metar[:70]}")
+        if sim.get("turb"):
+            wind_ms = _metar_wind_speed_ms(dep_metar)
+            _log(f"[INFO]  Dryden turbulence: dep wind {wind_ms:.1f} m/s -> "
+                 f"intensity {round(0.1 * wind_ms, 3)} m/s")
         _log(f"[INFO]  Invoking: {' '.join(argv[:5])}...\n")
 
         proc = subprocess.Popen(argv, cwd=str(ROOT),
@@ -783,12 +942,27 @@ def _run_sim(cfg: dict) -> None:
 
         _log(f"\n[{'PASS' if sim_rc == 0 else 'FAIL'}]  test_flight.py exited rc={sim_rc}")
 
+        plots, metrics = {}, {}
+        if sim_rc <= 1:
+            csvs = sorted(out_dir.glob("dash_results_*.csv"))
+            if csvs:
+                plots, metrics = _process_results_csv(csvs[-1], out_dir, plot_cols)
+                if plots:
+                    _log(f"[INFO]  Saved plot(s): {', '.join(plots.values())}")
+            else:
+                _log("[CAUT]  no dash_results_*.csv found — skipping plots")
+
     except Exception as e:
         _log(f"[FAIL]  {e}")
         sim_rc = 3
+        plots, metrics = {}, {}
 
+    global _last_out_dir, _last_plots, _last_metrics
     with _sim_lock:
         _sim_done = True; _sim_rc = sim_rc
+        _last_out_dir = out_dir
+        _last_plots   = plots
+        _last_metrics = metrics
 
 
 class _Handler(BaseHTTPRequestHandler):
@@ -838,6 +1012,29 @@ class _Handler(BaseHTTPRequestHandler):
                 "done": done, "exit_code": rc,
             }).encode()
             self._send(200, "application/json", payload)
+
+        elif path == "/plots":
+            with _sim_lock:
+                out_dir = _last_out_dir
+                plots   = dict(_last_plots)
+                metrics = dict(_last_metrics)
+            payload = json.dumps({
+                "out_dir": str(out_dir) if out_dir else None,
+                "plots": [{"col": c, "url": f"/plot/{f}"} for c, f in plots.items()],
+                "metrics": metrics,
+            }).encode()
+            self._send(200, "application/json", payload)
+
+        elif path.startswith("/plot/"):
+            fname = path[len("/plot/"):]
+            with _sim_lock:
+                out_dir = _last_out_dir
+                allowed = set(_last_plots.values())
+            fpath = out_dir / fname if out_dir else None
+            if fname in allowed and fpath and fpath.exists():
+                self._send(200, "image/png", fpath.read_bytes())
+            else:
+                self._send(404, "text/plain", b"not found")
 
         else:
             self._send(404, "text/plain", b"not found")
