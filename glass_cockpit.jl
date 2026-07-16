@@ -1,7 +1,7 @@
-# glass_cockpit.jl:   eVTOL Tiltrotor Sim Glass Cockpit MIL-STD-3009 NVG
+# glass_cockpit.jl:    Glass Cockpit MIL-STD-3009 NVG
 # AUTHOR:              DANIEL DESAI
-# UPDATED:             2026-06-19
-# VERSION:             0.1.1
+# UPDATED:             2026-07-16
+# VERSION:             0.1.2
 #
 # GLMakie real-time instrument panel — NVG-compatible colour theme
 # per MIL-STD-3009 (Lighting, Aircraft, Night Vision Imaging System).
