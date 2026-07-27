@@ -1,7 +1,7 @@
 # rotor_system.jl:    Powerplant top-level model
 # AUTHOR:             DANIEL DESAI
-# UPDATED:            2026-06-25
-# VERSION:            0.1.4
+# UPDATED:            2026-07-26
+# VERSION:            0.2.0
 #
 # Motor swap patterns (all produce a valid RotorParams / RotorFleet):
 # ──────────────────────────────────────────────────────────────────────
@@ -47,6 +47,14 @@ Physical parameters for one rotor.  Two new fields vs Priority 2:
   blade_geom :: BladeGeometry  — geometry passed to blade_coefficients()
   motor      :: AbstractMotor  — power backend (electric / turboshaft / hybrid)
 
+v0.2.0 adds a per-rotor mode pair, consumed by rotor_mixer.jl:
+  lift   :: Bool — produces lift; true for a tiltrotor or a lift-only rotor
+  thrust :: Bool — produces cruise thrust; true for a tiltrotor or a pusher
+Both default true (tiltrotor), so a RotorUnit built without specifying them —
+including every pre-v0.2.0 call site — is unchanged. See rotor_mixer.jl's
+header for the four-combination mode table (TILT / LIFT-only / THRUST-only /
+out of service).
+
 All other fields retained for backwards compatibility with rotor_mixer.jl and
 the legacy kT/kQ momentum path.
 
@@ -73,6 +81,8 @@ Base.@kwdef struct RotorUnit
     spin_dir     :: Int            = 1
     blade_geom   :: BladeGeometry  = BG           # BEM blade geometry
     motor        :: AbstractMotor  = ElectricMotor(P_max_W=280_000.0)  # power backend
+    lift         :: Bool           = true         # produces lift    (rotor_mixer.jl)
+    thrust       :: Bool           = true         # produces thrust  (rotor_mixer.jl)
 end
 
 # ── Default unit constructors (S4-class geometry) ──────────────────────
@@ -97,6 +107,8 @@ function _default_unit(i::Int) :: RotorUnit
         spin_dir   = spin,
         blade_geom = BG,
         motor      = ElectricMotor(P_max_W=280_000.0),
+        lift       = true,
+        thrust     = true,
     )
 end
 
@@ -130,6 +142,65 @@ end
 n_rotors(fleet::RotorFleet)    = 6
 total_area(fleet::RotorFleet)  = sum(π * u.radius_m^2 for u in fleet.units)
 mean_radius(fleet::RotorFleet) = sum(u.radius_m for u in fleet.units) / 6.0
+
+"""
+    preflight_trim_warning(fleet=FLEET)
+
+Log a warning if the fleet's HOVER-active rotors (`lift=true` — this catches
+both TILT and LIFT-only; a THRUST-only rotor is gated off at tilt=0 regardless,
+see rotor_mixer.jl's `rotor_active`) cannot trim a zero pitch or roll moment.
+
+rotor_mixer.jl's allocator solves `T ≥ 0`: it can only ADD thrust to correct a
+moment, never subtract. If every hover-active rotor sits on the same side of
+the CG on an axis, the only way to satisfy a zero moment demand on that axis
+is to zero those rotors out entirely — which presents as "only some rotors
+spin" in the cockpit, and, if the survivors can't carry the aircraft's weight
+alone, as "the aircraft never leaves the ground and the tilt-gated rotors
+never engage either." Both are the allocator correctly solving an untrimmable
+layout, not a bug in the allocator or in RotorUnit's mode flags — this check
+exists so a bad `lift`/`thrust` assignment in rotor_config.csv fails loud at
+load time instead of being diagnosed from flight telemetry.
+
+Checks arm_x (pitch) and arm_y (roll) independently. Each passes if the
+hover-active set has EITHER a rotor with a clearly positive arm and one with a
+clearly negative arm on that axis (so the allocator has something to null a
+demand against), OR every hover-active rotor sits at (near) zero arm on that
+axis (so the demand is moot). `_ARM_EPS = 0.05` m is a tolerance against the
+stock 3.0–5.5 m arm scale, not a physical constant.
+
+Geometry-only: this does NOT run the actual NNLS solve, so it knows nothing
+about power_weights, moment-scale gains, or rotor saturation. It can pass a
+layout that still saturates a rotor at omega_max under load (see
+fleet_thrust_available for that separate T/W check), and in principle it
+could flag a layout that's fine at some nonzero demand but can't hold an
+exactly-zero one — in practice hover trim targets ~zero pitch/roll, so that
+edge case is not expected to matter.
+"""
+function preflight_trim_warning(fleet::RotorFleet = FLEET)
+    _ARM_EPS = 0.05   # m
+    hover_active = [u for u in fleet.units if u.lift]
+    if isempty(hover_active)
+        @warn "Rotor config: no rotor has lift=true — this fleet cannot hover at all."
+        return
+    end
+    for (axis, armf) in (("pitch (arm_x)", u -> u.arm_x_m), ("roll (arm_y)", u -> u.arm_y_m))
+        arms = armf.(hover_active)
+        has_pos      = any(a ->  a >  _ARM_EPS, arms)
+        has_neg      = any(a ->  a < -_ARM_EPS, arms)
+        all_near_zero = all(a -> abs(a) <= _ARM_EPS, arms)
+        if !(all_near_zero || (has_pos && has_neg))
+            ids = join(("R$(u.id)" for u in hover_active), ", ")
+            side = has_pos ? "positive" : "negative"
+            @warn "Rotor config: hover trim check failed on $axis. Every lift=true " *
+                  "rotor ($ids) sits at a $side (or zero) arm — none negative. A " *
+                  "zero-$axis hover demand forces the allocator to zero out every " *
+                  "rotor on the wrong side rather than trim (T ≥ 0 constraint — see " *
+                  "the CAUTION note in rotor_mixer.jl's build_B). Rebalance which " *
+                  "rotors carry lift=true so they straddle the CG on this axis, or " *
+                  "confirm this fleet is not expected to hover with zero $axis demand."
+        end
+    end
+end
 
 # ── Legacy scalar interface (RP) ───────────────────────────────────────
 """
@@ -171,6 +242,9 @@ end
 #   powerplant — "electric" (default) | "turbine_electric"
 #                "turbine_electric" builds a TurboshaftEngine instead of ElectricMotor.
 #                P_max_kW is interpreted as TurboshaftEngine.P_sl_W for this powerplant.
+#   lift, thrust — Bool, both default true (tiltrotor). See rotor_mixer.jl's header for
+#                the four-combination mode table. Consumed by the allocator only;
+#                RotorUnit just carries them through from rotor_config.csv.
 #
 # Shared fuel tank: if multiple override entries share the same
 # "fuel_tank_id" string (e.g. both R1 and R2 set "fuel_tank_id": "TG_FWD"),
@@ -203,6 +277,17 @@ const FLEET = let
                 pitch_offset_deg = get(entry, "pitch_offset_deg",  bg.pitch_offset_deg),
             )
             _omega = get(entry, "rpm_hover", u.omega_nom * 60.0 / (2π)) * 2π / 60.0
+
+            # lift / thrust — per-rotor mode (rotor_mixer.jl v0.2.0+).
+            # windblade.py / test_flight.py write these as JSON booleans
+            # (parsed from rotor_config.csv's TRUE/FALSE columns). Absent or
+            # non-Bool defaults to true, so a test_card.json predating this
+            # field — or an entry that only overrides geometry — still reads
+            # as the tiltrotor it always was.
+            _lift   = get(entry, "lift",   true)
+            _thrust = get(entry, "thrust", true)
+            _lift   = _lift   isa Bool ? _lift   : true
+            _thrust = _thrust isa Bool ? _thrust : true
 
             _powerplant = get(entry, "powerplant", "electric")
             _motor = if _powerplant == "turbine_electric"
@@ -248,20 +333,29 @@ const FLEET = let
                 spin_dir   = u.spin_dir,
                 blade_geom = new_bg,
                 motor      = _motor,
+                lift       = _lift,
+                thrust     = _thrust,
             )
         end
         @info "Custom rotor geometry: $(length(_od)) rotor(s) overridden"
         for (id, u) in sort(collect(_od), by=first)
             _p_kw = u.motor isa ElectricMotor    ? u.motor.P_max_W / 1000.0 :
                     u.motor isa TurboshaftEngine ? u.motor.P_sl_W  / 1000.0 : NaN
-            @printf("  R%d: R=%.3fm  chord=%.3fm  n_blades=%d  rpm_nom=%.0f  P_max=%.0f kW  motor=%s
+            # Inline rather than calling rotor_mixer.jl's rotor_mode: that file
+            # loads after rotor_system.jl (needs FLEET finalised first — see
+            # the load-order note in fly.jl), so it isn't defined yet here.
+            _mode = u.lift && u.thrust ? "TILT" :
+                    u.lift             ? "LIFT" :
+                    u.thrust           ? "THRUST" : "OFF"
+            @printf("  R%d: R=%.3fm  chord=%.3fm  n_blades=%d  rpm_nom=%.0f  P_max=%.0f kW  motor=%s  mode=%s
 ",
                     id, u.radius_m, u.blade_geom.chord, u.blade_geom.n_blades,
-                    u.omega_nom * 60.0 / (2π), _p_kw, typeof(u.motor))
+                    u.omega_nom * 60.0 / (2π), _p_kw, typeof(u.motor), _mode)
         end
         RotorFleet(_od)
     end
 end
+preflight_trim_warning(FLEET)   # @warn if lift=true rotors can't trim zero pitch/roll
 const RP    = RotorParams()
 
 rotor_area(rp::RotorParams) = rp.n * π * rp.radius_m^2
