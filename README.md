@@ -4,7 +4,7 @@ Advanced Air Mobility Model-Based Prototyping
 
 ## Architecture
 
-WINDBLADE is a multi-language eVTOL simulation environment. Each language allocation owns a distinct concern:
+WINDBLADE is a multi-language powered-lift aircraft simulation environment. Each language allocation owns a distinct concern:
 
 | Layer | Language | Role |
 |---|---|---|
@@ -19,37 +19,39 @@ The Julia ODE solver calls into `autopilot.so` via `@ccall` at each save step. T
 
 ```
 windblade/
-├── windblade.py                        # Entry point — launcher and browser GUI
-├── test_flight.py                      # Automated flight test runner
-├── fly.jl                              # ODE integrator, state vector, controls dispatch
-├── glass_cockpit.jl                    # GLMakie HMI — MIL-STD-3009 NVG palette
-├── Makefile                            # Builds autopilot.so and hotas binary
-│
-├── controls/
-│   ├── autopilot.cpp                   # Flight controller (compiled to autopilot.so)
-│   └── hotas.c                         # Thrustmaster T.Flight HOTAS One reader
-│
-├── planning/
-│   ├── mission_planner.jl              # Phase scheduler and timing constants
-│   ├── navigation.jl                   # Waypoint guidance and nav map state
-│   └── test_card.json                  # Mission parameters
-│
-├── subsystems/
-│   ├── airframe.jl                     # Aerodynamics and body forces
-│   ├── actuators.jl                    # Actuator model and PID tuning constants
-│   ├── battery_model.jl                # Equivalent-circuit battery and SoC model
-│   ├── landing_gear.jl                 # Three-point strut contact model
-│   └── propulsion/
-│       ├── blades.jl                   # Blade element momentum (BEM) implementation
-│       ├── powerplant.jl               # Motor/engine backends (electric, turboshaft)
-│       ├── fuel.jl                     # Fuel chemistry and tank capacity
-│       ├── rotor_system.jl             # Powerplant top-level model
-│       ├── rotor_mixer.jl              # Wrench-to-RPM control allocator
-│       └── rotor_config.csv            # Per-rotor geometry and power parameters
-│
-└── world/
-    ├── atmosphere.jl                   # Troposphere ISA model
-    └── terrain.jl                      # Piecewise-linear ground-track elevation
+├── controls
+│   ├── autopilot.cpp
+│   └── hotas.c
+├── fly.jl
+├── gui
+│   ├── cockpit.css
+│   ├── cockpit.js
+│   ├── glass_cockpit.jl
+│   └── index.html
+├── planning
+│   ├── airports.csv
+│   ├── mission_planner.jl
+│   ├── navigation.jl
+│   └── test_card.json
+├── subsystems
+│   ├── actuators.jl
+│   ├── airframe.jl
+│   ├── battery_model.jl
+│   ├── landing_gear.jl
+│   └── propulsion
+│       ├── blades.jl
+│       ├── fuel.jl
+│       ├── powerplant.jl
+│       ├── rotor_config.csv
+│       ├── rotor_mixer.jl
+│       └── rotor_system.jl
+├── test_flight.py
+├── windblade.py
+└── world
+    ├── atmosphere.jl
+    ├── sensors.jl
+    └── terrain.jl
+
 ```
 
 ## State Vector
