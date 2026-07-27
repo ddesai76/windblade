@@ -2,8 +2,8 @@
 #
 # windblade.py:   Mission Planner and Launcher GUI
 # AUTHOR:         DANIEL DESAI
-# UPDATED:        2026-07-16
-# VERSION:        0.1.4
+# UPDATED:        2026-07-26
+# VERSION:        0.1.5
 
 """
 Single-file entry point.  Run and a browser window opens with the
@@ -73,6 +73,30 @@ def caution(msg): print(f"{YL}[{_ts()}  CAUT ]{NC}  {msg}")
 def warn(msg):    print(f"{RD}[{_ts()}  FAIL ]{NC}  {msg}")
 
 # ── rotor CSV reader ──────────────────────────────────────────────────────────
+_TRUE = {"true", "t", "yes", "y", "1"}
+_FALSE = {"false", "f", "no", "n", "0"}
+
+def _csv_bool(raw, default: bool = True) -> bool:
+    """lift / thrust columns. Anything unrecognised (including blank) keeps the
+    default so an older CSV without these columns reads as an all-tiltrotor
+    fleet, which is what it was."""
+    s = (raw or "").strip().lower()
+    if s in _TRUE:
+        return True
+    if s in _FALSE:
+        return False
+    return default
+
+def rotor_mode(lift: bool, thrust: bool) -> str:
+    """TILT | LIFT | THRUST | OFF — see the mode table in rotor_mixer.jl."""
+    if lift and thrust:
+        return "TILT"
+    if lift:
+        return "LIFT"
+    if thrust:
+        return "THRUST"
+    return "OFF"
+
 def read_rotor_csv() -> list[dict]:
     if not ROTOR_CSV.exists():
         return []
@@ -92,8 +116,11 @@ def read_rotor_csv() -> list[dict]:
                     "P_max_kW":          float(row["P_max_kW"].strip()),
                     "rpm_hover":         float(row["rpm_hover"].strip()),
                     "powerplant":   (row.get("powerplant") or "electric").strip(),
+                    "lift":              _csv_bool(row.get("lift")),
+                    "thrust":            _csv_bool(row.get("thrust")),
                     "notes":             (row.get("notes") or "").strip(),
                 })
+                rows[-1]["mode"] = rotor_mode(rows[-1]["lift"], rows[-1]["thrust"])
             except (KeyError, ValueError):
                 continue
     return rows
@@ -494,8 +521,8 @@ html,body{background:var(--bg);color:var(--nw);font-family:var(--mono);font-size
       <div class="sec">Fleet — <span id="rotor-csv-path" style="color:var(--faint)"></span></div>
       <div id="rotor-fleet-error" style="display:none" class="callout" style="border-color:var(--rd);color:var(--rd)"></div>
       <table class="data-table" id="rotor-table">
-        <thead><tr><th>#</th><th>Position</th><th>R (m)</th><th>Blades</th><th>Chord (m)</th><th>Twist root</th><th>P max (kW)</th><th>RPM hover</th><th>Propulsion</th><th>Notes</th></tr></thead>
-        <tbody id="rotor-tbody"><tr><td colspan="10" class="c-dim" style="padding:12px 8px">Loading...</td></tr></tbody>
+        <thead><tr><th>#</th><th>Position</th><th>R (m)</th><th>Blades</th><th>Chord (m)</th><th>Twist root</th><th>P max (kW)</th><th>RPM hover</th><th>Propulsion</th><th>Mode</th><th>Notes</th></tr></thead>
+        <tbody id="rotor-tbody"><tr><td colspan="11" class="c-dim" style="padding:12px 8px">Loading...</td></tr></tbody>
       </table>
       <p class="path-note">Edit <code>subsystems/propulsion/rotor_config.csv</code> and click the Rotor Config tab again to reload.</p>
       <div id="rotor-disks" style="margin-top:24px"></div>
@@ -631,10 +658,31 @@ function propCls(t){
   return '';
 }
 
+// TILT = tiltrotor, LIFT = lift-only (never tilts, runs in cruise as needed),
+// THRUST = fixed pusher (powers up during transition), OFF = out of service
+// (no lift, no thrust, weight and moment still carried).
+// Preflight one-liner: how the fleet is configured, so an unintended OFF or a
+// forgotten pusher shows up on the checklist rather than in the telemetry.
+function fleetModeSummary(){
+  if(!rotorData.length)return '';
+  var c={TILT:0,LIFT:0,THRUST:0,OFF:0};
+  rotorData.forEach(function(r){ c[r.mode||'TILT']=(c[r.mode||'TILT']||0)+1; });
+  var parts=[];
+  ['TILT','LIFT','THRUST','OFF'].forEach(function(k){ if(c[k])parts.push(c[k]+' '+k); });
+  return parts.length?'  ('+parts.join(', ')+')':'';
+}
+
+function modeCls(m){
+  if(m==='LIFT')return 'c-ok';
+  if(m==='THRUST')return 'c-warn';
+  if(m==='OFF')return 'c-dim';
+  return '';
+}
+
 function renderRotorTable(rotors){
   var tbody=document.getElementById('rotor-tbody');
   if(!rotors.length){
-    tbody.innerHTML='<tr><td colspan="10" class="c-warn" style="padding:12px 8px">rotor_config.csv not found or empty</td></tr>';
+    tbody.innerHTML='<tr><td colspan="11" class="c-warn" style="padding:12px 8px">rotor_config.csv not found or empty</td></tr>';
     return;
   }
   tbody.innerHTML=rotors.map((r,i)=>{
@@ -653,6 +701,7 @@ function renderRotorTable(rotors){
       +'<td class="'+pc+'">'+r.P_max_kW.toFixed(0)+'</td>'
       +'<td class="'+rpc+'">'+r.rpm_hover.toFixed(0)+'</td>'
       +'<td class="'+propCls(pt)+'">'+pt+'</td>'
+      +'<td class="'+modeCls(r.mode)+'">'+(r.mode||'TILT')+'</td>'
       +'<td class="c-dim">'+r.notes+'</td>'
       +'</tr>';
   }).join('');
@@ -742,7 +791,7 @@ function renderChecklist(){
     ['ARR',    v('arr-metar').substring(0,65), 'var(--ga)'],
     ['CRUISE', v('speed')+' km/h  /  '+v('alt')+' ft MSL  /  hover '+v('hover')+' m', 'var(--ga)'],
     ['MODE',   v('mode').toUpperCase()+'  x'+v('sfactor'), 'var(--ga)'],
-    ['ROTORS', rotorData.length+' rotors loaded from rotor_config.csv', rotorData.length?'var(--ga)':'var(--yl)'],
+    ['ROTORS', rotorData.length+' rotors loaded from rotor_config.csv'+fleetModeSummary(), rotorData.length?'var(--ga)':'var(--yl)'],
 
   ];
   document.getElementById('checklist').innerHTML=rows.map(([l,d,c])=>
