@@ -1,0 +1,152 @@
+/* cockpit.css — WINDBLADE glass cockpit
+ *
+ * THEME SYSTEM
+ * ------------
+ * .theme-nvg  (DEFAULT) — MIL-STD-3009 NVG-compatible palette, numerically
+ *   identical to the v0.1.1 GLMakie `TH` NamedTuple.  Traceability:
+ *   each value is the CIE 1976 (u',v') Table II centre converted
+ *   u'v' -> xy -> XYZ -> linear sRGB -> gamma sRGB (see glass_cockpit.jl
+ *   header for the full derivation and the NVIS Blue vendor-extension
+ *   rationale).  Do not "brighten" these — luminance restraint is the
+ *   compliance property.
+ *
+ * .theme-day — full-luminance EFIS palette benchmarked on Garmin
+ *   G1000 NXi / G3000 conventions: white primary symbology, blue-over-
+ *   brown attitude sphere, green/amber/red alerting per
+ *   FAA AC 23.1311-1C (colour use for alerting) and AC 25-11B Table 2
+ *   industry practice.  NOT NVG-safe — cockpit lighting mode only.
+ *
+ * Toggle: header button, or ?theme=day query param.
+ */
+
+.theme-nvg {
+  --bg:         #080908;  /* RGBf(.031,.035,.031) */
+  --panel:      #0c0e0c;  /* RGBf(.047,.055,.047) */
+  --panel-hi:   #101310;  /* RGBf(.063,.075,.063) */
+  --stroke:     #242e21;  /* RGBf(.14,.18,.13)   */
+  --stroke-hi:  #405238;  /* RGBf(.25,.32,.22)   */
+  --text:       #b8ffd1;  /* NVIS White  (u'=.197 v'=.453) */
+  --text-dim:   #618a6b;  /* NVIS White dimmed ~50% */
+  --text-faint: #2e4233;  /* NVIS White dimmed ~25% */
+  --green:      #00e040;  /* NVIS Green A (u'=.214 v'=.487) — normal */
+  --amber:      #e8c000;  /* NVIS Yellow  (u'=.260 v'=.520) — caution */
+  --red:        #ff2800;  /* NVIS Red     (u'=.400 v'=.460) — warning */
+  --blue:       #47a6f2;  /* NVIS Blue vendor ext. — secondary info */
+  --sky:        #0a1a14;  /* ADI sky — low-luminance NVIS-safe tint */
+  --ground:     #1a1405;  /* ADI ground — dark olive */
+  --bug-fill:   rgba(0, 56, 13, 0.95);   /* value-bug box fill (RGBAf 0,.22,.05) */
+}
+
+.theme-day {
+  --bg:         #05070b;
+  --panel:      #0d1117;
+  --panel-hi:   #151b24;
+  --stroke:     #2b333e;
+  --stroke-hi:  #46525f;
+  --text:       #f2f6f8;  /* white — normal operating symbology */
+  --text-dim:   #93a0ab;
+  --text-faint: #47525c;
+  --green:      #16d84b;  /* normal / in-envelope */
+  --amber:      #ffb300;  /* caution */
+  --red:        #ff2a1a;  /* warning */
+  --blue:       #35b7f0;  /* informational */
+  --sky:        #1b66c9;  /* EFIS attitude blue */
+  --ground:     #6b4a24;  /* EFIS attitude brown */
+  --bug-fill:   rgba(6, 10, 14, 0.95);
+}
+
+* { margin: 0; padding: 0; box-sizing: border-box; }
+
+html, body {
+  height: 100%;
+  background: var(--bg);
+  color: var(--text);
+  font-family: "B612", system-ui, sans-serif;
+  overflow: hidden;
+}
+
+#cockpit {
+  height: 100vh;
+  min-width: 1280px;
+  display: grid;
+  grid-template-rows: 40px 1fr 52px 220px;
+  grid-template-columns: 200px 1fr 200px;
+  gap: 4px;
+  padding: 6px;
+}
+#cockpit.has-nav {
+  grid-template-columns: 200px 1fr 200px minmax(560px, 44%);
+}
+
+/* ── Header bar ─────────────────────────────────────────────────── */
+#hdr {
+  grid-row: 1; grid-column: 1 / -1;
+  background: var(--panel-hi);
+  border: 1px solid var(--stroke-hi);
+  outline: 1px solid var(--stroke);
+  outline-offset: -3px;
+  display: flex; align-items: center;
+  padding: 0 10px;
+  gap: 16px;
+}
+#clock {
+  font-family: "B612 Mono", monospace;
+  font-weight: 700; font-size: 20px;
+  min-width: 90px;
+}
+#apt {
+  flex: 1; text-align: center;
+  color: var(--blue);
+  font-size: 17px; letter-spacing: 0.04em;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+#link {
+  font-size: 10px; font-weight: 700; letter-spacing: 0.08em;
+  padding: 3px 8px;
+  border: 1px solid var(--green); color: var(--green);
+  border-radius: 2px;
+}
+#link.down { border-color: var(--red); color: var(--red); animation: blink 1s step-end infinite; }
+@keyframes blink { 50% { opacity: 0.25; } }
+#themeBtn {
+  font-family: "B612", sans-serif;
+  font-size: 10px; font-weight: 700; letter-spacing: 0.08em;
+  background: none;
+  border: 1px solid var(--stroke-hi); color: var(--text-dim);
+  border-radius: 2px;
+  padding: 3px 8px; cursor: pointer;
+}
+#themeBtn:hover, #themeBtn:focus-visible { color: var(--text); border-color: var(--text-dim); outline: none; }
+#phase {
+  font-family: "B612 Mono", monospace;
+  font-weight: 700; font-size: 19px;
+  min-width: 200px; text-align: right;
+  color: var(--amber);
+}
+#phase.landed { color: var(--green); }
+#phase.dash   { color: var(--blue); }
+
+/* ── Instrument cells ───────────────────────────────────────────── */
+.cell {
+  position: relative;
+  background: var(--panel);
+  border: 1px solid var(--stroke-hi);
+  outline: 1px solid var(--stroke);
+  outline-offset: -3px;
+  overflow: hidden;
+}
+.cell canvas { position: absolute; inset: 4px; width: calc(100% - 8px); height: calc(100% - 8px); display: block; }
+
+#c-speed   { grid-row: 2; grid-column: 1; }
+#c-adi     { grid-row: 2; grid-column: 2; background: var(--bg); }
+#c-alt     { grid-row: 2; grid-column: 3; }
+#c-vcon    { grid-row: 3; grid-column: 1; }
+#c-hdg     { grid-row: 3; grid-column: 2; }
+#c-contact { grid-row: 3; grid-column: 3; }
+#c-power   { grid-row: 4; grid-column: 1; }
+#c-rotors  { grid-row: 4; grid-column: 2; background: var(--bg); border: none; }
+#c-tvec    { grid-row: 4; grid-column: 3; }
+#c-nav     { grid-row: 2 / 4; grid-column: 4; border-color: var(--stroke-hi); display: none; }
+#c-vsd     { grid-row: 4; grid-column: 4; border-color: var(--stroke-hi); display: none; }
+#cockpit.has-nav #c-nav { display: block; }
+#cockpit.has-nav #c-vsd { display: block; }

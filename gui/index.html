@@ -1,0 +1,43 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>WINDBLADE — Glass Cockpit</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<!-- B612: Airbus's cockpit-legibility typeface (SIL OFL), same family the
+     GLMakie panel used.  B612 Mono carries the numeric readouts (tabular
+     digits); B612 400/700 carries labels and annunciators.  If the fonts
+     can't load (offline host), system-ui/monospace fallbacks apply. -->
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=B612:ital,wght@0,400;0,700&family=B612+Mono:wght@400;700&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="cockpit.css">
+</head>
+<body class="theme-nvg">
+<div id="cockpit">
+  <header id="hdr">
+    <div id="clock">00:00</div>
+    <div id="apt"></div>
+    <div id="link">LINK</div>
+    <button id="themeBtn" type="button" title="Toggle NVG / day palette">DAY</button>
+    <div id="phase">&mdash;</div>
+  </header>
+
+  <div class="cell" id="c-speed"><canvas id="cv-speed"></canvas></div>
+  <div class="cell" id="c-adi"><canvas id="cv-adi"></canvas></div>
+  <div class="cell" id="c-alt"><canvas id="cv-alt"></canvas></div>
+
+  <div class="cell" id="c-vcon"><canvas id="cv-vcon"></canvas></div>
+  <div class="cell" id="c-hdg"><canvas id="cv-hdg"></canvas></div>
+  <div class="cell" id="c-contact"><canvas id="cv-contact"></canvas></div>
+
+  <div class="cell" id="c-power"><canvas id="cv-power"></canvas></div>
+  <div class="cell" id="c-rotors"><canvas id="cv-rotors"></canvas></div>
+  <div class="cell" id="c-tvec"><canvas id="cv-tvec"></canvas></div>
+
+  <div class="cell" id="c-nav"><canvas id="cv-nav"></canvas></div>
+  <div class="cell" id="c-vsd"><canvas id="cv-vsd"></canvas></div>
+</div>
+<script src="cockpit.js"></script>
+</body>
+</html>
