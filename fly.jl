@@ -1,7 +1,7 @@
 # fly.jl:         Advanced Air Mobility Tiltrotor Simulation
 # AUTHOR:         DANIEL DESAI
-# UPDATED:        2026-07-15
-# VERSION:        0.1.4
+# UPDATED:        2026-07-26
+# VERSION:        0.1.5
 #
 # Single entry point: loads subsystems, runs physics model, streams to glass_cockpit.jl
 #
@@ -177,7 +177,7 @@ const _t_cb_ref    = Ref(0.0)
 
 # ── Cockpit ───────────────────────────────────────────────────────────
 if SHOW_GUI
-    include(joinpath(@__DIR__, "glass_cockpit.jl"))
+    include(joinpath(@__DIR__, "gui", "glass_cockpit.jl"))
 end
 
 # ── Derived constants ─────────────────────────────────────────────────
@@ -243,6 +243,13 @@ struct APConfig
     dash_speed_ms        :: Cdouble
     descent_rate_fw_ms   :: Cdouble   # sink-rate target above hover_alt_m AGL
     land_descent_rate_ms :: Cdouble   # sink-rate target inside hover_alt_m AGL
+    back_trans_entry_ms  :: Cdouble   # USER-DEFINED back-transition target airspeed.
+                                       # TC.back_trans_entry_ms — confirmed against
+                                       # mission_planner.jl's TC constructor
+                                       # (landing.back_trans_entry_ms, default 50.0),
+                                       # and it's the same value descent_initiation_range()
+                                       # already reads as bt_entry_ms — this was the
+                                       # only leg of the pipeline that hadn't wired it in.
     soc_min              :: Cdouble
     pitch_limit_rad      :: Cdouble
     roll_limit_rad       :: Cdouble
@@ -270,6 +277,7 @@ function make_ap_config()::APConfig
         Float64(TC.dash_speed_kmh) / 3.6,
         Float64(TC.descent_rate_fw_ms),   # descent_rate_fw_ms
         Float64(TC.land_descent_rate_ms), # land_descent_rate_ms
+        Float64(TC.back_trans_entry_ms),  # back_trans_entry_ms — user-defined bt speed
         0.10,                             # soc_min
         deg2rad(60.0),                    # pitch_limit_rad
         deg2rad(45.0),                    # roll_limit_rad
@@ -546,7 +554,7 @@ function build_ode(du, u, p, t)
     # Debug: cruise force balance (manual only)
     if MANUAL && mod(t, 5.0) < 0.02 && tilt > deg2rad(30.0)
         wl = wing_lift(max(vx_air, 0.0), pitch, tilt, alt)
-        rv = thrust_act * cos(tilt)
+        rv = thrust_act * fleet_thrust_fraction(FLEET, tilt, ALLOC)[2]
         @printf("CRUISE: vx=%.1f tilt=%.1f° thrust=%.0f lift=%.0f vert=%.0f W=%.0f Fz=%.0f\n",
                 vx_air, rad2deg(tilt), thrust_act, wl, rv, WEIGHT_N, rv+wl-WEIGHT_N)
     end
@@ -554,9 +562,16 @@ function build_ode(du, u, p, t)
     # ── Forces ────────────────────────────────────────────────────────
     f_body = fuselage_drag(vx_air, alt)
 
+    # Fleet-aware thrust direction (v0.2.0). For the stock all-tiltrotor fleet
+    # this is bit-identical to (sin(tilt), cos(tilt)) — see
+    # fleet_thrust_fraction's docstring in rotor_mixer.jl. For a fleet with
+    # lift-only or pusher rotors, it correctly withholds forward thrust from
+    # an idle pusher and never attributes vertical lift to one.
+    fx_frac, fz_frac = fleet_thrust_fraction(FLEET, tilt, ALLOC)
+
     Fx = if MANUAL
-        fwd = thrust_act * sin(tilt) +
-              thrust_act * sin(clamp(-pitch, 0.0, 0.35)) * cos(tilt)
+        fwd = thrust_act * fx_frac +
+              thrust_act * sin(clamp(-pitch, 0.0, 0.35)) * fz_frac
         fwd - wing_drag(max(vx_air, 0.1), pitch, tilt, alt) * ge_d - f_body
     elseif τ < 0.0
         -f_body
@@ -569,26 +584,26 @@ function build_ode(du, u, p, t)
         wd      = wing_drag(max(vx_air, 0.1), pitch, tilt, alt)
         spd_err = max(TARGET_MS - vx, 0.0)
         f_max   = AIRFRAME.mass_kg * spd_err * 2.0 / TC.trans_duration_s
-        fwd     = min(thrust_act * sin(tilt), wd + f_max)
+        fwd     = min(thrust_act * fx_frac, wd + f_max)
         fwd - wd - f_body
     else
         # fw_climb, dash, fw_descent, back_transition, descent:
-        # In cruise (tilt=π/2): sin(tilt)≈1 → full forward thrust.
-        # In hover (tilt=0):    sin(tilt)=0 → rotor thrust is vertical.
+        # In cruise (tilt=π/2, stock fleet): fx_frac≈1 → full forward thrust.
+        # In hover (tilt=0):                 fx_frac=0 → rotor thrust is vertical.
         #   Forward motion comes from body pitch tilting the thrust vector.
-        #   Include pitch contribution: Fx += thrust * sin(-pitch) * cos(tilt)
+        #   Include pitch contribution: Fx += thrust * sin(-pitch) * fz_frac
         #   Negative pitch = nose down = forward thrust.
         #   Clamped to nose-down only (no reverse thrust from nose-up pitch).
         let pitch_fwd = clamp(-pitch, -0.35, 0.35)
             # thrust_act < 0 means reverse rotors — braking force regardless of tilt
-            thrust_fwd = thrust_act * sin(tilt) +
-                         thrust_act * sin(pitch_fwd) * cos(tilt)
+            thrust_fwd = thrust_act * fx_frac +
+                         thrust_act * sin(pitch_fwd) * fz_frac
             thrust_fwd - wing_drag(max(vx_air, 0.1), pitch, tilt, alt) * ge_d - f_body
         end
     end
 
     Fz = if MANUAL
-        thrust_act * cos(tilt) * ge_r +
+        thrust_act * fz_frac * ge_r +
             wing_lift(max(vx_air, 0.0), pitch, tilt, alt) * ge_l - WEIGHT_N
     elseif τ < 0.0
         # Hover climb: use thrust directly without ground effect multiplier.
@@ -607,6 +622,14 @@ function build_ode(du, u, p, t)
         # what build_ode actually computes. The allocator still tilts the
         # thrust vector physically; this approximation only affects the
         # altitude hold loop, not the forward-flight force balance.
+        #
+        # v0.2.0 NOTE: deliberately left as `thrust_act`, NOT `thrust_act *
+        # fz_frac`, to avoid changing the validated KAXX→KSAF transition
+        # profile — see fx_frac/fz_frac note above. For a mixed fleet this
+        # is a known approximation: a fixed pusher's share of thrust_act
+        # contributes no real vertical lift, so this slightly overstates Fz
+        # during transition specifically. Revisit if a mixed-fleet mission
+        # shows a transition-altitude bias; untested as of this pass.
         thrust_act + wing_lift(vx_air, pitch, tilt, alt) * ge_l - WEIGHT_N
     elseif τ < T.T_FW_CLIMB
         # fw_climb: altitude P-controller drives to dash_altitude_m
@@ -624,7 +647,7 @@ function build_ode(du, u, p, t)
         # prevents descent to KSAF elevation.
         _ge_terrain  = Float64(alt) - terrain_alt(TERRAIN, Float64(x), Float64(y))
         ge_r_terrain = rotor_ge(max(_ge_terrain, 0.0))
-        thrust_act * cos(tilt) * ge_r_terrain +
+        thrust_act * fz_frac * ge_r_terrain +
             wing_lift(max(vx_air, 0.0), pitch, tilt, alt) * ge_l - WEIGHT_N
     end
 
@@ -661,8 +684,12 @@ function build_ode(du, u, p, t)
     end
 
     # ── Rotor moments ─────────────────────────────────────────────────
-    ct        = cos(tilt)
-    ct_eff    = MANUAL ? 1.0 : ct
+    # ct_eff was cos(tilt): correct for an all-tiltrotor fleet (no moment
+    # authority once the rotors point forward), wrong for any fleet with
+    # lift-only rotors, which stay vertical and are meant to keep trimming
+    # the aircraft through cruise — see moment_authority's docstring in
+    # rotor_mixer.jl. Bit-identical to the old cos(tilt) for the stock fleet.
+    ct_eff    = MANUAL ? 1.0 : moment_authority(FLEET, tilt, ALLOC)
     M_x_rotor = ALLOC.roll_moment_scale  * 3.0 * (roll_cmd        - roll)  * ct_eff
     _pitch_cmd_s = clamp(pitch_cmd, -0.524, 0.524)
     M_y_rotor = ALLOC.pitch_moment_scale * (3.0 * (_pitch_cmd_s - pitch) - 2.0 * ωy) * ct_eff
@@ -949,7 +976,7 @@ function make_saving_cb(rt_factor::Float64, dt_ref::Ref{Float64})
                     Float64(ctrl_cb.thrust_cmd),
                     Float64(ctrl_cb.pitch_cmd),
                     Float64(ctrl_cb.roll_cmd),
-                    0.0, tilt_f)
+                    0.0, tilt_f, ALLOC, FLEET)
                 rpm_each, kw_each = allocate_wrench_vx(T_w, Mx_w, My_w, Mz_w,
                                         FLEET, tilt_f, vx_f, Float64(alt), ALLOC)
                 power_kw  = sum(kw_each)
@@ -1018,12 +1045,16 @@ function make_saving_cb(rt_factor::Float64, dt_ref::Ref{Float64})
             _cp=cos(Float64(pitch)/2); _sp=sin(Float64(pitch)/2)
             _cy=cos(Float64(yaw)/2);  _sy=sin(Float64(yaw)/2)
             _cb_vz = (Float64(alt) - alt_f_prev) / cb_dt
+            # Hoisted so the CSV row and the cockpit telemetry (v0.3 radar
+            # altimeter / VRS CAS message) share one computation.
+            _vrs_cb  = _cb_vz < 0.0 ?
+                vrs_factor(Float64(u[11]) / 6.0, _cb_vz,
+                           rho(Float64(alt)), π * RP.radius_m^2) : 1.0
+            _aglterr = Float64(alt) - terrain_alt(TERRAIN, Float64(x_m), Float64(y_m))
             write_csv_row((
                 t=t, tau=τ, phase=phase, speed=speed_kmh, alt_msl_ft=alt_msl_ft,
                 power=power_kw,
-                vrs_factor=_cb_vz < 0.0 ?
-                    vrs_factor(Float64(u[11]) / 6.0, _cb_vz,
-                               rho(Float64(alt)), π * RP.radius_m^2) : 1.0,
+                vrs_factor=_vrs_cb,
                 tilt=rad2deg(tilt),
                 soc=soc*100, voltage=voltage_v, batt_temp=batt_temp,
                 q0=_cr*_cp*_cy + _sr*_sp*_sy,
@@ -1031,7 +1062,7 @@ function make_saving_cb(rt_factor::Float64, dt_ref::Ref{Float64})
                 q2=_cr*_sp*_cy + _sr*_cp*_sy,
                 q3=_cr*_cp*_sy - _sr*_sp*_cy,
                 x_m=Float64(x_m), y_m=Float64(y_m), alt_agl_m=Float64(alt),
-                alt_agl_terrain_m=Float64(alt) - terrain_alt(TERRAIN, Float64(x_m), Float64(y_m)),
+                alt_agl_terrain_m=_aglterr,
                 omega_x=ωx_f, omega_y=ωy_f, omega_z=ωz_f,
                 gx=gx, gy=gy, gz=gz,
                 turb_u=Float64(u[20]), turb_v=Float64(u[21]), turb_w=Float64(u[22]),
@@ -1066,6 +1097,20 @@ function make_saving_cb(rt_factor::Float64, dt_ref::Ref{Float64})
                 s.vals[IDX.gx]       = gx
                 s.vals[IDX.gy]       = gy
                 s.vals[IDX.gz]       = gz
+                # Cockpit thrust-vector telemetry (glass_cockpit.jl thrust-
+                # vector gauge): fleet combined thrust direction in the body
+                # x-z plane, as a fraction of commanded |T|.  Reuses the
+                # already-validated fleet_thrust_fraction (rotor_mixer.jl)
+                # and the tilt_f local computed above — telemetry plumbing
+                # only, no physics change.
+                fx_frac, fz_frac = fleet_thrust_fraction(FLEET, tilt_f, ALLOC)
+                s.vals[IDX.fx_frac]  = fx_frac
+                s.vals[IDX.fz_frac]  = fz_frac
+                # v0.3 telemetry: VRS thrust factor (CAS message) and height
+                # above local terrain (radar altimeter / VSD) — same values
+                # already written to the CSV row above.
+                s.vals[IDX.vrs]           = _vrs_cb
+                s.vals[IDX.agl_terrain_m] = _aglterr
                 s.phase              = phase
                 s.fuel_kg            = fuel_kg
                 for i in 1:6
@@ -1099,7 +1144,7 @@ end
 # ══════════════════════════════════════════════════════════════════════
 function main()
     println("="^60)
-    println("eVTOL Tiltrotor — fly.jl v0.2.0")
+    println("Windblade::fly.jl v0.1.4")
     @printf("Mode: %s | GUI: %s | Speed: %.1fx\n",
             MANUAL ? "MANUAL (HOTAS)" : "AUTO (autopilot.so)",
             SHOW_GUI ? "ON" : "OFF", RT_FACTOR)
@@ -1294,17 +1339,19 @@ function main()
     close_csv_writer()
 
     if SHOW_GUI && fig !== nothing
-        println("Simulation complete. Close cockpit window to exit.")
-        # Retrieve the screen that was created when display(fig) was called.
+        println("Simulation complete. Close the cockpit browser tab(s) — or Ctrl-C — to exit.")
+        # Web-era equivalent of the old GLMakie window-open test: the
+        # cockpit is "open" while the server is up and at least one
+        # WebSocket client is connected (or none has connected yet).
         # Notify the observable on each tick so the cockpit stays live
-        # (phase frozen at landing, instruments visible) until the user
-        # closes the window.
+        # (phase frozen at landing, instruments visible) until the last
+        # browser tab closes.  See cockpit_open in glass_cockpit.jl.
         try
-            scr = GLMakie.getscreen(fig.scene)
-            while scr !== nothing && isopen(scr)
+            while cockpit_open(fig)
                 notify(_state_obs)
                 sleep(0.1)
             end
+            close(fig)
         catch
             # Fallback: sleep briefly then exit cleanly
             sleep(2.0)
