@@ -9,7 +9,7 @@ WINDBLADE is a multi-language eVTOL simulation environment. Each language alloca
 | Layer | Language | Role |
 |---|---|---|
 | Launcher / GUI | Python | Browser-based mission planning UI, test runner |
-| Physics / ODE | Julia | Subsystem models, state integrator, glass cockpit UI|
+| Physics / ODE | Julia | Subsystem models, state integrator |
 | Autopilot | C++ | Flight controller compiled to `autopilot.so` |
 | HOTAS input | C | Manual flight controls reader compiled to `controls/hotas` |
 
