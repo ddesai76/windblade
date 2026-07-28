@@ -48,7 +48,6 @@ windblade/
 ├── windblade.py
 └── world
     ├── atmosphere.jl
-    ├── sensors.jl
     └── terrain.jl
 
 ```
