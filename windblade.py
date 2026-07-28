@@ -1,56 +1,71 @@
 #!/usr/bin/env python3
 #
-# windblade.py:   Mission Planner and Launcher GUI
+# windblade.py:   Mission Planner, Flight Engine, and Launcher GUI
 # AUTHOR:         DANIEL DESAI
-# UPDATED:        2026-07-26
-# VERSION:        0.1.5
+# UPDATED:        2026-07-28
+# VERSION:        0.2.0
+#
+# Single standalone file: planning, build, simulate, and analyse all run
+# in-process here — `python3 windblade.py --auto ...` / `--manual ...` runs
+# the full pipeline headlessly, no browser. See run_pipeline() / RunSpec.
+#
+# The Rotor Config tab is editable in the GUI. Edits are SESSION-ONLY: they
+# never touch subsystems/propulsion/rotor_config.csv on disk. An edit updates
+# the in-memory fleet used for the next run (and, if a test_card.json already
+# exists, patches its rotor_fleet block immediately so the Launch preview and
+# any --no-plan run reflect it). "Reset to CSV" drops the session override and
+# goes back to reading the file. Restarting the server also drops it — nothing
+# session-only ever survives a restart, by design.
 
 """
 Single-file entry point.  Run and a browser window opens with the
-mission planner GUI.  Fill in the form and Launch — the script
-passes weather (METARs) and cruise parameters directly to test_flight.py
-as CLI args, reads subsystems/propulsion/rotor_config.csv for the rotor
-fleet, injects overrides into test_card.json after planning, then runs
-the sim. 
+mission planner GUI.
 
 Usage
 -----
     python3 windblade.py                    # open GUI on http://localhost:5780
     python3 windblade.py --port 8080        # alternate port
     python3 windblade.py --no-browser       # server only, open URL manually
-    python3 windblade.py --preview-command  # GUI opens; Launch prints command only
+    python3 windblade.py --auto ...         # headless pipeline run, no GUI
+    python3 windblade.py --manual ...       # headless HOTAS run, no GUI
 
-Rotor fleet is defined in subsystems/propulsion/rotor_config.csv.
-Edit that file and reload the Rotor Config tab to see changes.
+Rotor fleet is defined in subsystems/propulsion/rotor_config.csv. Edit that
+file for a permanent change, or use the Rotor Config tab for a session-only
+change that affects runs only until the server restarts or you hit Reset.
 
-Exit codes mirror test_flight.py:
+Exit codes (headless / pipeline):
     0   all checks passed
-    1   one or more test_executive checks failed
+    1   one or more checks failed
     2   build failed
     3   sim failed / no CSV produced
     4   flight planning failed
-   10   config payload invalid
-   11   backup/restore error
-   12   file write error
 """
 
 from __future__ import annotations
 
 import argparse
 import csv as csv_mod
+import datetime
+import gzip
 import json
+import math
 import os
 import re
-import shutil
+import signal
 import subprocess
 import sys
-import textwrap
 import threading
+import time
+import urllib.request
 import webbrowser
-from datetime import datetime, UTC
+from dataclasses import dataclass, field
+from datetime import UTC
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
+from typing import Optional
 from urllib.parse import urlparse
+
+import numpy as np
 
 # ── repo layout ───────────────────────────────────────────────────────────────
 ROOT       = Path(__file__).parent.resolve()
@@ -58,32 +73,84 @@ PLANNING   = ROOT / "planning"
 CONTROLS   = ROOT / "controls"
 ROTOR_CSV  = ROOT / "subsystems" / "propulsion" / "rotor_config.csv"
 
-# ── NVG terminal palette ──────────────────────────────────────────────────────
+# ── Physical constants ────────────────────────────────────────────────────────
+R_DRY_AIR    = 287.058
+R_EARTH      = 6_371_000.0
+STD_PRESSURE = 101_325.0
+STD_TEMP_K   = 288.15
+LAPSE_RATE   = 0.0065
+G            = 9.80665
+INHG_TO_PA   = 3386.389
+MPS_PER_KT   = 0.514444
+FT_TO_M      = 0.3048
+
+SRTM_MIRRORS = [
+    "https://opentopography.s3.sdsc.edu/raster/SRTM_GL3/SRTM_GL3_srtm/{tile}.hgt",
+    "https://dds.cr.usgs.gov/srtm/version2_1/SRTM3/North_America/{tile}.hgt.zip",
+]
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  Logging — one seam, five helpers. Every log line in the engine, the build
+#  step, and the sim runner goes through these, so a GUI run can tee its
+#  output into the browser log just by pointing _LOG_SINK at a list. See
+#  _run_sim for where that happens.
+# ══════════════════════════════════════════════════════════════════════════════
 _ESC = "\033["
 NC   = f"{_ESC}0m";  NW = f"{_ESC}96m"; GA = f"{_ESC}92m"
 YL   = f"{_ESC}93m"; RD = f"{_ESC}91m"; BL = f"{_ESC}96m"
 DIM  = f"{_ESC}2m";  BOLD = f"{_ESC}1m"
 _BAR = "─" * 60
 
-def _ts():        return datetime.now().strftime("%H:%M:%S")
-def _hdr(msg):    print(f"\n{DIM}{_BAR}{NC}\n{NW}{BOLD}  {msg}{NC}\n{DIM}{_BAR}{NC}\n")
-def info(msg):    print(f"{BL}[{_ts()}  INFO ]{NC}  {msg}")
-def ok(msg):      print(f"{GA}[{_ts()}  PASS ]{NC}  {msg}")
-def caution(msg): print(f"{YL}[{_ts()}  CAUT ]{NC}  {msg}")
-def warn(msg):    print(f"{RD}[{_ts()}  FAIL ]{NC}  {msg}")
+_LOG_SINK: list | None = None      # non-None only while a GUI run is active
+_LOG_LOCK = threading.Lock()
 
-# ── rotor CSV reader ──────────────────────────────────────────────────────────
-_TRUE = {"true", "t", "yes", "y", "1"}
-_FALSE = {"false", "f", "no", "n", "0"}
+def _ts(): return datetime.datetime.now().strftime("%H:%M:%S")
+
+def _emit(line: str) -> None:
+    print(line)
+    with _LOG_LOCK:
+        if _LOG_SINK is not None:
+            _LOG_SINK.append(line)
+
+def info(msg):    _emit(f"{BL}[{_ts()}  INFO ]{NC}  {msg}")
+def success(msg): _emit(f"{GA}[{_ts()}  PASS ]{NC}  {msg}")
+def warn(msg):    _emit(f"{YL}[{_ts()}  CAUT ]{NC}  {msg}")
+def fail(msg):    _emit(f"{RD}[{_ts()}  FAIL ]{NC}  {msg}")
+def header(msg):  _emit(f"\n{DIM}{_BAR}{NC}\n{NW}{BOLD}  {msg}{NC}\n{DIM}{_BAR}{NC}\n")
+def plain(msg):   _emit(msg)   # for output that has no PASS/CAUT/FAIL severity
+                                # (compiler dumps, the analysis report, the summary)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  Rotor fleet — one shared parser, one shared baseline. Every reader of
+#  rotor_config.csv (the GUI table, the test-card generator, the SQLite
+#  export) goes through _read_rotor_rows_from_csv() and _S4_DEFAULTS below,
+#  so the "differs from baseline" highlighting and the override-suppression
+#  logic always agree on what "default" means.
+# ══════════════════════════════════════════════════════════════════════════════
+
+# S4-class baseline. Rows that match these exactly are not emitted as
+# test_card.json overrides (keeps the card clean for the all-default case),
+# and are what the GUI table diffs against to highlight non-default cells.
+_S4_DEFAULTS = {
+    "R_m": 1.45, "n_blades": 5, "chord_m": 0.096,
+    "twist_root_deg": 16.0, "twist_tip_deg": 6.0,
+    "pitch_offset_deg": 4.4, "P_max_kW": 236.0, "rpm_hover": 1284.0,
+}
+_S4_POWERPLANT = "electric"
+POWERPLANTS    = ["electric", "turbine_electric", "turboshaft"]
+
+_TRUE_STRS  = {"true", "t", "yes", "y", "1"}
+_FALSE_STRS = {"false", "f", "no", "n", "0"}
 
 def _csv_bool(raw, default: bool = True) -> bool:
     """lift / thrust columns. Anything unrecognised (including blank) keeps the
     default so an older CSV without these columns reads as an all-tiltrotor
     fleet, which is what it was."""
     s = (raw or "").strip().lower()
-    if s in _TRUE:
+    if s in _TRUE_STRS:
         return True
-    if s in _FALSE:
+    if s in _FALSE_STRS:
         return False
     return default
 
@@ -97,7 +164,10 @@ def rotor_mode(lift: bool, thrust: bool) -> str:
         return "THRUST"
     return "OFF"
 
-def read_rotor_csv() -> list[dict]:
+def _read_rotor_rows_from_csv() -> list[dict]:
+    """Parse subsystems/propulsion/rotor_config.csv. This is the ONLY CSV
+    reader in the file — both the GUI table and the test-card generator go
+    through it (or through the session override, see _effective_rotor_rows)."""
     if not ROTOR_CSV.exists():
         return []
     rows = []
@@ -125,15 +195,172 @@ def read_rotor_csv() -> list[dict]:
                 continue
     return rows
 
-def _patch_test_card(card_path: Path, overrides: list) -> None:
-    if not overrides:
-        return
-    card = json.loads(card_path.read_text())
-    card.setdefault("rotor_fleet", {})["overrides"] = overrides
-    card_path.write_text(json.dumps(card, indent=2))
+def _rotor_fleet_overrides(rows: list[dict] | None = None) -> dict:
+    """Build the rotor_fleet block for test_card.json: a per-rotor override
+    entry for any rotor whose geometry/powerplant/mode differs from the S4
+    baseline. Rows that are all-default produce no entry.
 
-# Wind group in a METAR: dddss[Ggmax]KT|MPS|KMH  (ddd or VRB, ss = sustained speed)
-_METAR_WIND_RE = re.compile(r'\b(?:\d{3}|VRB)(\d{2,3})(?:G\d{2,3})?(KT|MPS|KMH)\b')
+    rows=None reads the CSV directly — this is the CLI/headless path (no
+    session concept applies there). The GUI path always passes explicit rows
+    (the session override if one is active, otherwise a CSV read it already
+    did), so this function never re-reads disk out from under a session edit.
+    """
+    if rows is None:
+        rows = _read_rotor_rows_from_csv()
+    overrides = []
+    for r in rows:
+        entry = {"rotor_id": r["rotor_id"]}
+        changed = False
+        for field_name, default in _S4_DEFAULTS.items():
+            val = r[field_name]
+            if isinstance(default, int):
+                val = int(round(val))
+            if abs(val - default) > 1e-9:
+                changed = True
+            entry[field_name] = val
+        powerplant = r.get("powerplant") or _S4_POWERPLANT
+        entry["powerplant"] = powerplant
+        if powerplant != _S4_POWERPLANT:
+            changed = True
+        lift, thrust = bool(r.get("lift", True)), bool(r.get("thrust", True))
+        entry["lift"], entry["thrust"] = lift, thrust
+        if not (lift and thrust):
+            changed = True
+        entry["notes"] = r.get("notes", "")
+        if changed:
+            overrides.append(entry)
+    return {"overrides": overrides}
+
+# ── Session-only rotor override (never written to rotor_config.csv) ──────────
+_rotor_session_rows: list[dict] | None = None
+_rotor_session_lock = threading.Lock()
+
+def _effective_rotor_rows() -> tuple[list[dict], str]:
+    """Rows to use for the *next* run: the session override if one is active,
+    else a fresh CSV read. Returns (rows, source) where source is
+    'session' or 'csv', so callers/log lines can say which was used."""
+    with _rotor_session_lock:
+        session = _rotor_session_rows
+    if session is not None:
+        return list(session), "session"
+    return _read_rotor_rows_from_csv(), "csv"
+
+def _validate_rotor_rows(rows_in: list) -> tuple[bool, list[dict], list[dict], list[str]]:
+    """Validate a posted rotor fleet. Returns (ok, normalized_rows, errors,
+    warnings). Never touches disk. Rejects the whole payload on any error —
+    no partial application.
+
+    The fleet size and the set of rotor_ids are fixed to whatever
+    rotor_config.csv defines — this only edits the values of the rotors
+    already in that file. Adding or removing a rotor changes the aircraft
+    configuration and has to happen in the CSV directly.
+    """
+    errors:   list[dict] = []
+    warnings: list[str]  = []
+    n = len(rows_in)
+
+    csv_rows = _read_rotor_rows_from_csv()
+    expected_n = len(csv_rows) or n   # if the CSV is missing/empty, fall back
+    expected_ids = {r["rotor_id"] for r in csv_rows} if csv_rows else None
+
+    if n != expected_n:
+        errors.append({"row": None, "field": "fleet", "message":
+                        f"Fleet must have exactly {expected_n} rotor(s), matching "
+                        f"rotor_config.csv — add or remove a rotor by editing the "
+                        f"CSV directly, not from this run."})
+        return False, [], errors, warnings
+    if not (2 <= n <= 8):
+        errors.append({"row": None, "field": "fleet", "message":
+                        f"Invalid rotor count: {n}. Fleet must have 2–8 rotors."})
+        return False, [], errors, warnings
+
+    def _num(row, i, field_name, lo, hi):
+        raw = row.get(field_name)
+        try:
+            v = float(raw)
+        except (TypeError, ValueError):
+            errors.append({"row": i, "field": field_name, "message": "not a number"})
+            return None
+        if not (lo <= v <= hi):
+            errors.append({"row": i, "field": field_name,
+                            "message": f"{v} outside [{lo}, {hi}]"})
+            return None
+        return v
+
+    normalized = []
+    seen_ids: set[int] = set()
+    for i, row in enumerate(rows_in):
+        try:
+            rid = int(row.get("rotor_id"))
+        except (TypeError, ValueError):
+            errors.append({"row": i, "field": "rotor_id", "message": "not an integer"})
+            continue
+        if rid in seen_ids:
+            errors.append({"row": i, "field": "rotor_id", "message": f"duplicate id {rid}"})
+        seen_ids.add(rid)
+
+        R_m              = _num(row, i, "R_m",              0.1, 6.0)
+        n_blades_raw     = row.get("n_blades")
+        chord_m          = _num(row, i, "chord_m",           0.01, 1.0)
+        twist_root_deg   = _num(row, i, "twist_root_deg",   -30.0, 60.0)
+        twist_tip_deg    = _num(row, i, "twist_tip_deg",    -30.0, 60.0)
+        pitch_offset_deg = _num(row, i, "pitch_offset_deg", -20.0, 20.0)
+        P_max_kW         = _num(row, i, "P_max_kW",          1.0, 5000.0)
+        rpm_hover        = _num(row, i, "rpm_hover",         100.0, 6000.0)
+
+        try:
+            n_blades = int(n_blades_raw)
+            if not (2 <= n_blades <= 12):
+                errors.append({"row": i, "field": "n_blades", "message": "outside [2, 12]"})
+        except (TypeError, ValueError):
+            errors.append({"row": i, "field": "n_blades", "message": "not an integer"})
+            n_blades = None
+
+        if R_m is not None and chord_m is not None and chord_m >= R_m:
+            errors.append({"row": i, "field": "chord_m",
+                            "message": "chord_m must be less than R_m"})
+
+        powerplant = (row.get("powerplant") or "electric").strip()
+        if powerplant not in POWERPLANTS:
+            errors.append({"row": i, "field": "powerplant",
+                            "message": f"must be one of {POWERPLANTS}"})
+
+        lift   = bool(row.get("lift", True))
+        thrust = bool(row.get("thrust", True))
+        notes  = re.sub(r"[,\n\r]", " ", str(row.get("notes", ""))).strip()
+
+        if None in (R_m, chord_m, twist_root_deg, twist_tip_deg, pitch_offset_deg,
+                    P_max_kW, rpm_hover, n_blades):
+            continue  # this row already carries at least one error above
+
+        entry = {
+            "rotor_id": rid, "R_m": R_m, "n_blades": n_blades, "chord_m": chord_m,
+            "twist_root_deg": twist_root_deg, "twist_tip_deg": twist_tip_deg,
+            "pitch_offset_deg": pitch_offset_deg, "P_max_kW": P_max_kW,
+            "rpm_hover": rpm_hover, "powerplant": powerplant,
+            "lift": lift, "thrust": thrust, "notes": notes,
+        }
+        entry["mode"] = rotor_mode(lift, thrust)
+        normalized.append(entry)
+
+        # advisory: tip Mach
+        tip_speed = (rpm_hover / 60.0) * 2 * math.pi * R_m
+        if tip_speed > 0.75 * 340.0:
+            warnings.append(f"rotor {rid}: tip speed {tip_speed:.0f} m/s — above M0.75")
+
+    if not errors and not any(r["lift"] for r in normalized):
+        warnings.append("no lift-capable rotor in the fleet — hover will not converge")
+
+    if not errors and expected_ids is not None:
+        got_ids = {r["rotor_id"] for r in normalized}
+        if got_ids != expected_ids:
+            errors.append({"row": None, "field": "rotor_id", "message":
+                            f"rotor IDs must match rotor_config.csv exactly "
+                            f"(expected {sorted(expected_ids)}, got {sorted(got_ids)}) — "
+                            f"renumbering, adding, or removing a rotor isn't allowed here."})
+
+    return (len(errors) == 0), normalized, errors, warnings
+
 
 def _metar_wind_speed_ms(metar: str) -> float:
     """Sustained wind speed in m/s parsed from a raw METAR string, or 0.0 if none found."""
@@ -148,49 +375,1063 @@ def _metar_wind_speed_ms(metar: str) -> float:
     if unit == "KMH": return speed / 3.6
     return 0.0
 
-def _build_argv(sim: dict, out_dir: Path,
-                dep_metar: str = "", arr_metar: str = "",
-                cru: dict = {}) -> list[str]:
-    mode = sim.get("mode", "auto")
-    sf   = sim.get("speed_factor", None)
-    gui  = sim.get("gui", False)
-    argv = [sys.executable, str(ROOT / "test_flight.py"), f"--{mode}"]
-    if mode == "auto" and sf is not None and not gui:
-        argv += ["--speed", str(sf)]
-    if gui and mode == "auto":
-        argv += ["--gui"]
-    if sim.get("terrain"):  argv += ["--terrain"]
-    if sim.get("no_build"): argv += ["--no-build"]
-    if sim.get("no_plan"):  argv += ["--no-plan"]
-    if sim.get("db"):       argv += ["--db"]
-    argv += ["--out", str(out_dir)]
-    # Pass weather and cruise directly — no planning/ files needed
-    if dep_metar: argv += ["--dep-metar", dep_metar]
-    if arr_metar: argv += ["--arr-metar", arr_metar]
-    if cru.get("speed_kmh"):            argv += ["--speed-kmh",      str(cru["speed_kmh"])]
-    if cru.get("altitude_ft"):          argv += ["--alt-ft",          str(cru["altitude_ft"])]
-    if cru.get("hover_alt_m"):          argv += ["--hover-m",            str(cru["hover_alt_m"])]
-    if cru.get("back_trans_speed_ms"):  argv += ["--bt-speed-ms",        str(cru["back_trans_speed_ms"])]
-    if cru.get("nacelle_tilt_deg"):     argv += ["--nacelle-tilt-deg",   str(cru["nacelle_tilt_deg"])]
-    if sim.get("turb"):
-        turb_intensity = round(0.1 * _metar_wind_speed_ms(dep_metar), 3)
-        if turb_intensity > 0:
-            argv += ["--turb-intensity", str(turb_intensity)]
-    return argv
+# Wind group in a METAR: dddss[Ggmax]KT|MPS|KMH  (ddd or VRB, ss = sustained speed)
+_METAR_WIND_RE = re.compile(r'\b(?:\d{3}|VRB)(\d{2,3})(?:G\d{2,3})?(KT|MPS|KMH)\b')
 
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  Flight engine — plan → build → simulate → analyse
+# ══════════════════════════════════════════════════════════════════════════════
+
+# ── planning/dash.py  →  DashConfig ───────────────────────────────────────────
+
+@dataclass
+class DashConfig:
+    speed_kmh:              float           = 300.0
+    altitude_ft:            float           = 11500.0
+    hover_alt_m:            float           = 30.0
+    back_trans_speed_ms:    float           = 50.0
+    nacelle_tilt_deg:       float           = 65.0
+    heading_deg:            Optional[float] = None
+    turbulence_intensity_ms: float          = 0.0   # Dryden σ (m/s); 0=off
+    terrain:     bool            = False
+
+    @classmethod
+    def load(cls) -> "DashConfig":
+        import importlib.util
+        path = PLANNING / "dash.py"
+        if not path.exists():
+            warn("planning/dash.py not found — using defaults (300 km/h, 11500 ft)")
+            return cls()
+        spec = importlib.util.spec_from_file_location("dash", path)
+        mod  = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return cls(
+            speed_kmh   = float(getattr(mod, "SPEED_KMH",   300.0)),
+            altitude_ft = float(getattr(mod, "ALTITUDE_FT", 11500.0)),
+            hover_alt_m = float(getattr(mod, "HOVER_ALT_M", 30.0)),
+            heading_deg          = getattr(mod, "HEADING_DEG", None),
+            terrain              = bool(getattr(mod,  "TERRAIN",              False)),
+            back_trans_speed_ms  = float(getattr(mod, "BACK_TRANS_SPEED_MS", 50.0)),
+            nacelle_tilt_deg     = float(getattr(mod, "NACELLE_TILT_DEG",   65.0)),
+        )
+
+
+# ── Airport database ──────────────────────────────────────────────────────────
+
+@dataclass
+class Airport:
+    icao:   str
+    lat:    float
+    lon:    float
+    elev_m: float
+
+
+def load_airports() -> dict[str, Airport]:
+    """CSV format (header required): icao,lat_deg,lon_deg,elev_m"""
+    path = PLANNING / "airports.csv"
+    out: dict[str, Airport] = {}
+    if not path.exists():
+        return out
+    with open(path, newline="", encoding="utf-8") as f:
+        for row in csv_mod.DictReader(f):
+            try:
+                icao = row["icao"].strip().upper()
+                out[icao] = Airport(icao=icao,
+                                    lat=float(row["lat_deg"]),
+                                    lon=float(row["lon_deg"]),
+                                    elev_m=float(row["elev_m"]))
+            except (KeyError, ValueError):
+                continue
+    return out
+
+
+def get_airport(icao: str, airports: dict[str, Airport],
+                interactive: bool = True) -> Airport:
+    """Return Airport for icao; prompt user if not in database and
+    interactive=True. interactive=False (always the case for GUI/server runs —
+    there is no TTY to prompt on) raises instead of blocking forever."""
+    if icao in airports:
+        return airports[icao]
+    if not interactive:
+        raise ValueError(
+            f"{icao} not in planning/airports.csv — add it there before "
+            f"running from the GUI (interactive entry is disabled for server runs)")
+    info(f"{icao} not in airports.csv")
+    return Airport(
+        icao=icao,
+        lat   = float(input("  Latitude  (°N, negative for S): ")),
+        lon   = float(input("  Longitude (°E, negative for W): ")),
+        elev_m= float(input("  Elevation (m MSL):               ")),
+    )
+
+
+# ── METAR parser ──────────────────────────────────────────────────────────────
+
+@dataclass
+class MetarData:
+    icao:          str
+    temp_c:        float
+    dewpoint_c:    float
+    altimeter_pa:  float
+    wind_from_deg: float
+    wind_speed_ms: float
+    wind_gust_ms:  float = 0.0
+    raw:           str   = ""
+
+
+def parse_metar(raw: str) -> MetarData:
+    raw   = raw.strip()
+    parts = raw.split()
+    if not parts:
+        raise ValueError("Empty METAR")
+    icao  = parts[0].upper()
+
+    temp_c = dew_c = 0.0
+    m = re.search(r'\b(M?\d{2})/(M?\d{2})\b', raw)
+    if m:
+        def dt(s): return -float(s[1:]) if s.startswith('M') else float(s)
+        temp_c, dew_c = dt(m.group(1)), dt(m.group(2))
+    t = re.search(r'\bT([01]\d{3})([01]\d{3})\b', raw)
+    if t:
+        def dtg(s): return (-1 if s[0]=='1' else 1)*int(s[1:])/10.0
+        temp_c, dew_c = dtg(t.group(1)), dtg(t.group(2))
+
+    alt_pa = STD_PRESSURE
+    a = re.search(r'\bA(\d{4})\b', raw)
+    if a: alt_pa = int(a.group(1))/100.0 * INHG_TO_PA
+    q = re.search(r'\bQ(\d{4})\b', raw)
+    if q: alt_pa = float(q.group(1))*100.0
+
+    wf = ws = wg = 0.0
+    w = re.search(r'\b(VRB|\d{3})(\d{2,3})(G(\d{2,3}))?(KT|MPS|KMH)\b', raw)
+    if w:
+        if w.group(1) != 'VRB': wf = float(w.group(1))
+        spd  = float(w.group(2)); gst = float(w.group(4) or 0)
+        u = w.group(5)
+        if   u=='KT':  ws,wg = spd*MPS_PER_KT, gst*MPS_PER_KT
+        elif u=='MPS': ws,wg = spd, gst
+        elif u=='KMH': ws,wg = spd/3.6, gst/3.6
+
+    return MetarData(icao=icao, temp_c=temp_c, dewpoint_c=dew_c,
+                     altimeter_pa=alt_pa, wind_from_deg=wf,
+                     wind_speed_ms=ws, wind_gust_ms=wg, raw=raw)
+
+
+def read_metar(path: Path) -> MetarData:
+    return parse_metar(path.read_text(encoding="utf-8", errors="replace").strip())
+
+
+# ── Geodesy helpers ────────────────────────────────────────────────────────────
+
+def haversine(lat1, lon1, lat2, lon2) -> float:
+    la1,lo1 = math.radians(lat1), math.radians(lon1)
+    la2,lo2 = math.radians(lat2), math.radians(lon2)
+    a = math.sin((la2-la1)/2)**2 + math.cos(la1)*math.cos(la2)*math.sin((lo2-lo1)/2)**2
+    return 2*R_EARTH*math.asin(math.sqrt(min(a,1.0)))
+
+
+def initial_bearing(lat1, lon1, lat2, lon2) -> float:
+    la1,lo1 = math.radians(lat1), math.radians(lon1)
+    la2,lo2 = math.radians(lat2), math.radians(lon2)
+    y = math.sin(lo2-lo1)*math.cos(la2)
+    x = math.cos(la1)*math.sin(la2)-math.sin(la1)*math.cos(la2)*math.cos(lo2-lo1)
+    return math.degrees(math.atan2(y,x)) % 360
+
+
+def station_pressure(qnh_pa: float, elev_m: float) -> float:
+    return qnh_pa*(1-LAPSE_RATE*elev_m/STD_TEMP_K)**(G/(R_DRY_AIR*LAPSE_RATE))
+
+
+def density_altitude_ft(pressure_pa: float, temp_c: float) -> float:
+    rho    = pressure_pa/(R_DRY_AIR*(temp_c+273.15))
+    rho_sl = STD_PRESSURE/(R_DRY_AIR*STD_TEMP_K)
+    return 145366*(1-(rho/rho_sl)**0.2349)
+
+
+# ── Test card  →  planning/test_card.json ─────────────────────────────────────
+
+def generate_test_card(dep: Airport, arr: Airport,
+                       dep_wx: MetarData, arr_wx: MetarData,
+                       cfg: DashConfig,
+                       rotor_rows: list[dict] | None = None) -> dict:
+    dist_m  = haversine(dep.lat, dep.lon, arr.lat, arr.lon)
+    brg     = initial_bearing(dep.lat, dep.lon, arr.lat, arr.lon)
+    brg_rad = math.radians(brg)
+
+    x_m = round(dist_m * math.cos(brg_rad), 0)
+    y_m = round(dist_m * math.sin(brg_rad), 0)
+    z_m = round(arr.elev_m - dep.elev_m, 0)
+
+    # Systematic offset pre-correction: waypoint is set 280 m upstream in
+    # fly.jl (make_ap_config). Shift nominal target by the same amount.
+    x_m -= round(280.0 * math.cos(brg_rad), 1)
+    y_m -= round(280.0 * math.sin(brg_rad), 1)
+
+    dash_alt_agl = cfg.altitude_ft * FT_TO_M - dep.elev_m
+    initial_hdg  = cfg.heading_deg if cfg.heading_deg is not None else round(brg, 1)
+
+    dep_psta = station_pressure(dep_wx.altimeter_pa, dep.elev_m)
+    arr_psta = station_pressure(arr_wx.altimeter_pa, arr.elev_m)
+    dep_da   = density_altitude_ft(dep_psta, dep_wx.temp_c)
+    arr_da   = density_altitude_ft(arr_psta, arr_wx.temp_c)
+
+    return {
+        "_comment":   (f"AIRCRAFT — {dep.icao} → {arr.icao}  "
+                       f"{dist_m/1000:.1f} km  {brg:.0f}°  "
+                       f"Generated by windblade.py"),
+        "_version":   "0.2.0",
+        "_generated": {
+            "dep_metar":           dep_wx.raw,
+            "arr_metar":           arr_wx.raw,
+            "distance_km":         round(dist_m/1000, 1),
+            "initial_bearing_deg": round(brg, 1),
+            "dep_density_alt_ft":  round(dep_da),
+            "arr_density_alt_ft":  round(arr_da),
+        },
+        "preflight":  {"hold_s": 5.0, "ramp_s": 2.0},
+        "hover":      {"alt_m": cfg.hover_alt_m, "climb_rate_ms": 3.0},
+        "transition": {"duration_s": 10.0, "thrust_comp": 0.5},
+        "fixed_wing": {
+            "dash_speed_kmh":     cfg.speed_kmh,
+            "dash_altitude_m":    round(dash_alt_agl, 0),
+            "climb_rate_fw_ms":   5.0,
+            "descent_rate_fw_ms": 4.0,
+            "nacelle_tilt_deg":   max(45.0, min(90.0, cfg.nacelle_tilt_deg)),
+        },
+        "landing": {
+            "pitch_up_deg":       35.0, "pitch_up_rate_s":    4.0,
+            "pitch_hold_s":       10.0, "pitch_down_s":       4.0,
+            "tilt_s":             12.0, "thrust_comp":        0.6,
+            "descent_rate_ms":     1.5,
+            "back_trans_entry_ms": cfg.back_trans_speed_ms,
+        },
+        "airport": {
+            "icao":                dep.icao,
+            "alt_m":               dep.elev_m,
+            "ambient_temp_c":      dep_wx.temp_c,
+            "ambient_pressure_pa": round(dep_wx.altimeter_pa, 0),
+            "wind_from_deg":       dep_wx.wind_from_deg,
+            "wind_speed_ms":       round(dep_wx.wind_speed_ms, 2),
+        },
+        "destination": {
+            "icao":                arr.icao,
+            "alt_m":               arr.elev_m,
+            "ambient_temp_c":      arr_wx.temp_c,
+            "ambient_pressure_pa": round(arr_wx.altimeter_pa, 0),
+            "wind_from_deg":       arr_wx.wind_from_deg,
+            "wind_speed_ms":       round(arr_wx.wind_speed_ms, 2),
+        },
+        "navigation": {
+            "return_to_base":      False,
+            "initial_heading_deg": initial_hdg,
+            "target":              {"x_m": x_m, "y_m": y_m, "z_m": z_m},
+        },
+        "rotor_fleet": _rotor_fleet_overrides(rotor_rows),
+        "turbulence_intensity_ms": cfg.turbulence_intensity_ms,
+    }
+
+
+# ── SRTM terrain profile  →  planning/terrain_profile.json ────────────────────
+
+def _tile_name(lat: float, lon: float) -> str:
+    ns = "N" if lat >= 0 else "S"
+    ew = "W" if lon < 0 else "E"
+    return f"{ns}{int(math.floor(lat)):02d}{ew}{int(math.floor(abs(lon))):03d}"
+
+
+def _download_tile(tile: str, cache_dir: Path) -> Optional[Path]:
+    hgt = cache_dir / f"{tile}.hgt"
+    if hgt.exists():
+        info(f"Terrain: cached {tile}.hgt"); return hgt
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    for tmpl in SRTM_MIRRORS:
+        url = tmpl.format(tile=tile)
+        info(f"Terrain: downloading {url}")
+        tmp = cache_dir / f"{tile}.tmp"
+        try:
+            try:
+                urllib.request.urlopen(
+                    urllib.request.Request(url, method="HEAD"), timeout=10)
+            except urllib.error.HTTPError as he:
+                if he.code == 404: continue
+            urllib.request.urlretrieve(url, tmp)
+            if url.endswith(".zip"):
+                import zipfile
+                with zipfile.ZipFile(tmp) as zf:
+                    names = [n for n in zf.namelist() if n.endswith(".hgt")]
+                    zf.extract(names[0], cache_dir)
+                    (cache_dir/names[0]).rename(hgt)
+                tmp.unlink(missing_ok=True)
+            elif url.endswith(".gz"):
+                with gzip.open(tmp,"rb") as gz, open(hgt,"wb") as out_f: out_f.write(gz.read())
+                tmp.unlink(missing_ok=True)
+            else:
+                tmp.rename(hgt)
+            info(f"Terrain: {hgt} ({hgt.stat().st_size//1024} KB)")
+            return hgt
+        except Exception as e:
+            warn(f"Terrain: mirror failed — {e}")
+            if tmp.exists(): tmp.unlink(missing_ok=True)
+    warn(f"Terrain: could not download {tile}.hgt — place manually in {cache_dir}")
+    return None
+
+
+def _read_hgt(path: Path):
+    data   = path.read_bytes()
+    n      = int(math.sqrt(len(data) // 2))
+    grid   = np.frombuffer(data, dtype=">i2").reshape(n, n).astype(np.float64)
+    grid   = np.ascontiguousarray(grid)
+    grid[grid == -32768] = np.nan
+    stem   = path.stem
+    lat_sw = float(stem[1:3]) * (-1 if stem[0] == "S" else 1)
+    lon_sw = float(stem[4:7]) * (-1 if stem[3] == "W" else 1)
+    return grid, lat_sw, lon_sw
+
+
+def _sample(grids, lat, lon):
+    t = _tile_name(lat, lon)
+    if t not in grids:
+        return np.nan
+    grid, lat_sw, lon_sw = grids[t]
+    n    = grid.shape[0]
+    step = 1.0 / (n - 1)
+    rf = (lat_sw + 1 - lat) / step
+    cf = (lon - lon_sw) / step
+    r0 = int(np.clip(rf, 0, n - 2))
+    c0 = int(np.clip(cf, 0, n - 2))
+    fr, fc = rf - r0, cf - c0
+    def g(r, c):
+        v = grid[r, c]
+        return 0.0 if np.isnan(v) else float(v)
+    return (g(r0,   c0  ) * (1-fr) * (1-fc)
+          + g(r0,   c0+1) * (1-fr) * fc
+          + g(r0+1, c0  ) * fr     * (1-fc)
+          + g(r0+1, c0+1) * fr     * fc)
+
+
+def build_terrain_profile(dep: Airport, arr: Airport,
+                           brg_deg: float, n_pts: int = 200,
+                           cache_dir: Optional[Path] = None) -> Optional[dict]:
+    if cache_dir is None: cache_dir = Path.home()/".cache"/"srtm"
+    needed = {_tile_name(dep.lat+i/(n_pts-1)*(arr.lat-dep.lat),
+                          dep.lon+i/(n_pts-1)*(arr.lon-dep.lon))
+              for i in range(n_pts)}
+    info(f"Terrain: tiles needed: {sorted(needed)}")
+    grids = {}
+    for tile in sorted(needed):
+        p = _download_tile(tile, cache_dir)
+        if p:
+            try: grids[tile] = _read_hgt(p)
+            except Exception as e: warn(f"Terrain: read {p.name} — {e}")
+    missing = needed - set(grids)
+    if missing: warn(f"Terrain: {len(missing)} unavailable {sorted(missing)} — linear fallback")
+    if not grids: return None
+    dist_m = haversine(dep.lat, dep.lon, arr.lat, arr.lon)
+    fs      = np.linspace(0.0, 1.0, n_pts)
+    lats    = dep.lat + fs * (arr.lat - dep.lat)
+    lons    = dep.lon + fs * (arr.lon - dep.lon)
+    xs      = (fs * dist_m).round(1).tolist()
+    fallback = dep.elev_m + fs * (arr.elev_m - dep.elev_m)
+    raw_elv  = np.array([_sample(grids, la, lo) for la, lo in zip(lats, lons)])
+    zs_arr   = np.where(np.isnan(raw_elv), fallback, raw_elv).round(1)
+    zs       = zs_arr.tolist()
+    info(f"Terrain: {n_pts} pts  elev {zs_arr.min():.0f}–{zs_arr.max():.0f} m")
+    return {"x_m": xs, "elev_m": zs, "origin_elev_m": dep.elev_m,
+            "source": "SRTM GL3", "dep": dep.icao, "arr": arr.icao, "n_points": n_pts}
+
+
+# ── Stage 1: flight planning ──────────────────────────────────────────────────
+
+def plan_flight(cfg: DashConfig, terrain_flag: bool,
+               dep_metar: Optional[str] = None,
+               arr_metar: Optional[str] = None,
+               rotor_rows: list[dict] | None = None,
+               interactive: bool = True) -> Path:
+    dep_wx = parse_metar(dep_metar) if dep_metar else read_metar(PLANNING / "METAR_DEP")
+    arr_wx = parse_metar(arr_metar) if arr_metar else read_metar(PLANNING / "METAR_ARR")
+
+    info(f"DEP: {dep_wx.icao}  {dep_wx.temp_c:.1f}°C  "
+         f"{dep_wx.altimeter_pa/100:.0f} hPa  "
+         f"wind {dep_wx.wind_speed_ms:.1f} m/s from {dep_wx.wind_from_deg:.0f}°")
+    info(f"ARR: {arr_wx.icao}  {arr_wx.temp_c:.1f}°C  "
+         f"{arr_wx.altimeter_pa/100:.0f} hPa  "
+         f"wind {arr_wx.wind_speed_ms:.1f} m/s from {arr_wx.wind_from_deg:.0f}°")
+
+    airports = load_airports()
+    dep = get_airport(dep_wx.icao, airports, interactive=interactive)
+    arr = get_airport(arr_wx.icao, airports, interactive=interactive)
+
+    info(f"{dep.icao}: {dep.lat:.4f}°N  {dep.lon:.4f}°E  {dep.elev_m:.0f} m MSL")
+    info(f"{arr.icao}: {arr.lat:.4f}°N  {arr.lon:.4f}°E  {arr.elev_m:.0f} m MSL")
+
+    card = generate_test_card(dep, arr, dep_wx, arr_wx, cfg, rotor_rows=rotor_rows)
+    g    = card["_generated"]
+    z_m  = card["navigation"]["target"]["z_m"]
+    info(f"Route: {dep.icao} → {arr.icao}  {g['distance_km']} km  {g['initial_bearing_deg']}°")
+    info(f"Cruise: {cfg.altitude_ft:.0f} ft MSL  "
+         f"({card['fixed_wing']['dash_altitude_m']:.0f} m AGL)")
+    info(f"Elevation offset: {z_m:+.0f} m  "
+         f"({'arrival lower' if z_m < 0 else 'arrival higher'})")
+    info(f"Density altitude — dep: {g['dep_density_alt_ft']:.0f} ft  "
+         f"arr: {g['arr_density_alt_ft']:.0f} ft")
+
+    card_path = PLANNING / "test_card.json"
+    card_path.write_text(json.dumps(card, indent=2))
+    success(f"test_card.json → {card_path}")
+
+    if terrain_flag or cfg.terrain:
+        info("Building terrain profile...")
+        profile = build_terrain_profile(dep, arr, brg_deg=g["initial_bearing_deg"])
+        if profile:
+            prof = PLANNING / "terrain_profile.json"
+            prof.write_text(json.dumps(profile, separators=(",", ":")))
+            success(f"terrain_profile.json ({profile['n_points']} pts)")
+        else:
+            warn("Terrain unavailable — predefined profile or flat_model will be used")
+
+    return card_path
+
+
+# ── Stage 2: build ─────────────────────────────────────────────────────────────
+
+def _compile_so(src: Path, out: Path, extra_flags: list[str] = []) -> bool:
+    """Compile a single C++ source to a shared library. Returns True on success."""
+    cmd = ["g++", "-O3", "-std=c++17", "-fPIC", "-shared",
+           *extra_flags, "-o", str(out), str(src)]
+    if not getattr(_compile_so, "_version_printed", False):
+        rv = subprocess.run(["g++", "--version"], capture_output=True, text=True)
+        info(f"g++ version: {rv.stdout.splitlines()[0] if rv.stdout else rv.stderr.strip()}")
+        _compile_so._version_printed = True
+    info(f"cmd: {' '.join(cmd)}")
+    r = subprocess.run(cmd, capture_output=True, text=True)
+    info(f"exit: {r.returncode}  stdout={repr(r.stdout[:200])}  stderr={repr(r.stderr[:200])}")
+    if r.returncode != 0:
+        fail(f"Compilation failed ({src.name}) [exit {r.returncode}]:")
+        if r.stdout.strip(): plain(r.stdout)
+        if r.stderr.strip(): plain(r.stderr)
+        return False
+    if r.stderr.strip():
+        warn(f"Compiler warnings ({src.name}):")
+        plain(r.stderr)
+    if not out.exists():
+        fail(f"Compilation appeared to succeed (exit 0) but {out.name} was not created.")
+        if r.stderr.strip(): plain(r.stderr)
+        return False
+    if out.stat().st_size < 1024:
+        fail(f"{out.name} is suspiciously small ({out.stat().st_size} bytes) — "
+             f"likely an empty library. Check that all source files were compiled.")
+        return False
+    return True
+
+
+def build_autopilot() -> str:
+    """Compile autopilot.cpp to a versioned shared library (autopilot_<ts>.so)
+    so Julia dlopens fresh on every run — no process restart needed."""
+    src_ap = CONTROLS / "autopilot.cpp"
+    if not src_ap.exists():
+        raise FileNotFoundError(f"autopilot.cpp not found at {src_ap}")
+
+    ver = str(int(time.time()))
+
+    so_ap = CONTROLS / f"autopilot_{ver}.so"
+    info(f"Compiling autopilot_{ver}.so")
+    if not _compile_so(src_ap, so_ap):
+        raise RuntimeError("autopilot build failed")
+    (CONTROLS / "autopilot.version").write_text(ver)
+    success(f"autopilot_{ver}.so")
+    for old in sorted(CONTROLS.glob("autopilot_*.so"),
+                      key=lambda p: p.stat().st_mtime, reverse=True)[1:]:
+        old.unlink(); info(f"Pruned {old.name}")
+
+    hc = CONTROLS / "hotas.c"
+    if hc.exists():
+        rh = subprocess.run(["gcc", "-O2", "-o", str(CONTROLS/"hotas"), str(hc)],
+                            capture_output=True, text=True)
+        success("hotas") if rh.returncode == 0 else warn("hotas build failed")
+
+    return ver
+
+
+# ── Stage 3: simulate ──────────────────────────────────────────────────────────
+
+_active_proc: subprocess.Popen | None = None
+_active_proc_lock = threading.Lock()
+_stop_requested = threading.Event()
+
+def _set_active_proc(p: subprocess.Popen | None) -> None:
+    global _active_proc
+    with _active_proc_lock:
+        _active_proc = p
+
+def request_stop() -> bool:
+    """Called from the /stop HTTP handler. Sends SIGINT to the running fly.jl
+    child (if any) and flags run_simulation to treat that as a normal manual
+    termination rather than a failure. Returns True if a process was signalled."""
+    _stop_requested.set()
+    with _active_proc_lock:
+        p = _active_proc
+    if p is None:
+        return False
+    try:
+        p.send_signal(signal.SIGINT)
+        return True
+    except Exception as e:
+        warn(f"stop: could not signal child process: {e}")
+        return False
+
+
+def run_simulation(gui: bool, manual: bool,
+                   speed: Optional[float], out_dir: Path) -> Path:
+    """Launch fly.jl and return the absolute path of the CSV it produced.
+
+    Streams the child process line-by-line through plain() rather than
+    inheriting stdio, so fly.jl's output reaches the browser log during a
+    GUI run.
+    """
+    ts       = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    csv_name = f"dash_results_{ts}.csv"
+    csv_path = out_dir / csv_name
+
+    env = os.environ.copy()
+    env["FLYSIM_CSV_PATH"] = str(csv_path)
+    if speed is not None:
+        env["FLYSIM_SPEED"] = str(speed)
+        if gui:
+            warn("--speed with --gui: GUI rendering will throttle the sim; "
+                 "drop --gui for accurate speed runs")
+
+    no_gui = (not gui) or (speed is not None and not gui)
+
+    threads = env.get("JULIA_NUM_THREADS", "auto")
+    cmd = ["julia", f"--threads={threads}", str(ROOT / "fly.jl")]
+    if no_gui:    cmd.append("--no-gui")
+    if manual:    cmd.append("--manual")
+
+    info(f"Command: {' '.join(cmd)}")
+    info(f"CSV target: {csv_path}")
+
+    _stop_requested.clear()
+    t0  = time.time()
+    proc = subprocess.Popen(cmd, env=env, cwd=str(ROOT),
+                            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                            text=True, bufsize=1)
+    _set_active_proc(proc)
+    try:
+        for line in proc.stdout:
+            plain(line.rstrip())
+        ret = proc.wait()
+    finally:
+        _set_active_proc(None)
+    elapsed = time.time() - t0
+
+    if ret != 0:
+        if _stop_requested.is_set():
+            warn(f"Simulation stopped by user (rc={ret}) after {elapsed:.0f}s "
+                 f"— attempting to salvage CSV")
+        else:
+            raise RuntimeError(f"fly.jl exited with error (code {ret})")
+    else:
+        success(f"Simulation complete in {elapsed:.0f}s")
+
+    if csv_path.exists():
+        rows = sum(1 for _ in csv_path.open()) - 1
+        success(f"CSV: {csv_path}  ({rows} rows)")
+        return csv_path
+
+    candidates = sorted(
+        list(out_dir.glob("dash_results_*.csv")) +
+        ([] if out_dir == ROOT else list(ROOT.glob("dash_results_*.csv"))),
+        key=lambda p: p.stat().st_mtime, reverse=True)
+
+    if not candidates:
+        raise FileNotFoundError(
+            f"No dash_results CSV found in {out_dir} or {ROOT}. "
+            "Check fly.jl output or set FLYSIM_CSV_PATH explicitly.")
+
+    found = candidates[0]
+    warn(f"Expected {csv_name} but found {found.name} — using that")
+    rows = sum(1 for _ in found.open()) - 1
+    success(f"CSV: {found}  ({rows} rows)")
+    return found
+
+
+# ── Stage 4: analysis ──────────────────────────────────────────────────────────
+
+SOC_MIN          = 20.0    # % minimum arrival SoC
+CRUISE_SPEED_TOL = 10.0    # km/h
+CRUISE_ALT_TOL   = 150.0   # ft
+LAND_ACCURACY_M  = 50.0    # m
+RPM_ASYM_LIMIT   = 0.05    # fraction
+GZ_NORMAL_LIMIT  = 1.5     # g
+GZ_EMERGENCY_LIM = 2.5     # g
+
+RPM_COLS = [f"rpm_r{i}" for i in range(1, 7)]
+
+def _steady(df, phase, tail_frac=0.20):
+    rows = df[df["phase"] == phase]
+    if rows.empty: return rows
+    n = len(rows)
+    if phase == "dash" and n >= 20:
+        lo = int(n * 0.25); hi = int(n * 0.75)
+        return rows.iloc[lo:hi]
+    return rows.iloc[-max(1, int(n * tail_frac)):]
+
+def _gear_events(df):
+    gc = df["gear_contact"].astype(float)
+    return df[(gc==1) & (gc.shift(1, fill_value=0)==0)]
+
+def _check_phase_sequence(df):
+    REQUIRED = ["landed", "hover", "transition", "fw_climb", "dash", "descent"]
+    OPTIONAL = ["fw_descent", "back_transition"]
+    seen    = df["phase"].drop_duplicates().tolist()
+    missing_req = [p for p in REQUIRED if p not in seen]
+    if missing_req:
+        return False, f"Missing required phases: {', '.join(missing_req)}"
+    CANONICAL = ["landed", "hover", "transition", "fw_climb", "dash",
+                 "fw_descent", "back_transition", "descent"]
+    present   = [p for p in CANONICAL if p in seen]
+    first_idx = {p: seen.index(p) for p in present}
+    ordered   = sorted(present, key=lambda p: first_idx[p])
+    if ordered != present:
+        bad = next((p for p, o in zip(present, ordered) if p != o), "?")
+        return False, f"Phase '{bad}' out of order. Observed: {' → '.join(ordered)}"
+    optional_found = [p for p in OPTIONAL if p in seen]
+    note = f" (optional: {', '.join(optional_found)})" if optional_found else " (fw_descent/back_transition not observed — fast decel)"
+    return True, f"All {len(REQUIRED)} required phases present in order{note}"
+
+def _check_cruise_speed(df, tc):
+    target = float(tc.get("fixed_wing",{}).get("dash_speed_kmh", 320.0))
+    steady = _steady(df, "dash")
+    if steady.empty: return False, f"No 'dash' phase rows", None, CRUISE_SPEED_TOL
+    spd = steady["speed_kmh"].to_numpy()
+    max_err = float(np.abs(spd-target).max()); rms_err = float(np.sqrt(((spd-target)**2).mean()))
+    return max_err<=CRUISE_SPEED_TOL, (f"mean {spd.mean():.1f} km/h | target {target:.0f} | "
+        f"max err {max_err:.1f} | RMS {rms_err:.1f} km/h (limit ±{CRUISE_SPEED_TOL:.0f})"), max_err, CRUISE_SPEED_TOL
+
+def _check_cruise_alt(df, tc):
+    dash_m  = float(tc.get("fixed_wing",{}).get("dash_altitude_m", 951.0))
+    orig_ft = float(tc.get("airport",{}).get("alt_m", 0.0))*3.28084
+    target  = orig_ft + dash_m*3.28084
+    steady  = _steady(df, "dash")
+    if steady.empty: return False, "No 'dash' phase rows", None, CRUISE_ALT_TOL
+    alts = steady["altitude_msl_ft"].to_numpy()
+    max_err = float(np.abs(alts-target).max()); rms_err = float(np.sqrt(((alts-target)**2).mean()))
+    return max_err<=CRUISE_ALT_TOL, (f"mean {alts.mean():.0f} ft | target {target:.0f} ft | "
+        f"max err {max_err:.0f} | RMS {rms_err:.0f} ft (limit ±{CRUISE_ALT_TOL:.0f})"), max_err, CRUISE_ALT_TOL
+
+def _check_soc(df):
+    ev = _gear_events(df)
+    soc = ev["soc_pct"].iloc[0] if not ev.empty else df["soc_pct"].iloc[-1]
+    src = f"t={ev['timestamp_s'].iloc[0]:.1f}s" if not ev.empty else "last row"
+    return soc>=SOC_MIN, f"SoC {soc:.2f}% at {src} | minimum {SOC_MIN:.0f}%", soc, SOC_MIN
+
+def _check_landing(df, tc):
+    nav   = tc.get("navigation",{}).get("target",{})
+    x_tgt, y_tgt = float(nav.get("x_m",0)), float(nav.get("y_m",0))
+    ev    = _gear_events(df)
+    td    = ev.iloc[0] if not ev.empty else df.iloc[-1]
+    src   = f"t={td['timestamp_s']:.1f}s" if not ev.empty else "last row"
+    err   = float(np.hypot(td["x_m"]-x_tgt, td["y_m"]-y_tgt))
+    return err<=LAND_ACCURACY_M, (f"touchdown ({td['x_m']:.0f}, {td['y_m']:.0f}) m at {src} | "
+        f"target ({x_tgt:.0f}, {y_tgt:.0f}) m | offset {err:.1f} m (limit {LAND_ACCURACY_M:.0f})"), err, LAND_ACCURACY_M
+
+def _check_rpm(df):
+    steady = _steady(df, "dash")
+    if steady.empty: return False, "No 'dash' phase rows", None, RPM_ASYM_LIMIT
+    rpm    = steady[RPM_COLS].to_numpy(dtype=float)
+    active = rpm[rpm.max(axis=1)>10]
+    if len(active)==0: return False, "All RPM near zero in dash", None, RPM_ASYM_LIMIT
+    means  = active.mean(axis=1, keepdims=True)
+    imb    = np.abs(active-means)/np.where(means>0,means,1)
+    max_imb= imb.max(); worst = int(imb.max(axis=0).argmax())+1
+    return max_imb<=RPM_ASYM_LIMIT, (f"max imbalance {max_imb*100:.2f}% (rotor {worst}) | "
+        f"mean {imb.mean()*100:.2f}% | limit {RPM_ASYM_LIMIT*100:.0f}%"), max_imb, RPM_ASYM_LIMIT
+
+def _check_gz(df):
+    ev = _gear_events(df)
+    if ev.empty: return False, "No gear_contact transition found", None, GZ_NORMAL_LIMIT
+    idx0  = ev.index[0]
+    peak  = float(df.loc[idx0:idx0+3,"gz"].abs().max())
+    if peak <= GZ_NORMAL_LIMIT:    status = f"≤ normal limit {GZ_NORMAL_LIMIT}g ✓"
+    elif peak <= GZ_EMERGENCY_LIM: status = f"exceeds normal {GZ_NORMAL_LIMIT}g but within emergency {GZ_EMERGENCY_LIM}g ⚠"
+    else:                          status = f"EXCEEDS emergency limit {GZ_EMERGENCY_LIM}g ✗"
+    return peak<=GZ_NORMAL_LIMIT, f"peak gz {peak:.3f}g at t={df.loc[idx0,'timestamp_s']:.2f}s — {status}", peak, GZ_NORMAL_LIMIT
+
+def run_analysis(csv_path: Path, card_path: Path, out_dir: Path) -> int:
+    try:
+        import pandas as pd
+    except ImportError:
+        warn("pandas not installed — skipping analysis. pip install pandas numpy")
+        return 0
+
+    df = pd.read_csv(csv_path, skipinitialspace=True)
+    df.columns = df.columns.str.strip()
+    df["phase"] = df["phase"].str.strip().str.lower().str.replace(r"^autoland:", "", regex=True)
+    tc = json.loads(card_path.read_text()) if card_path.exists() else {}
+
+    checks = [
+        ("Phase sequence",   _check_phase_sequence(df)),
+        ("Cruise speed",     _check_cruise_speed(df, tc)),
+        ("Cruise altitude",  _check_cruise_alt(df, tc)),
+        ("Arrival SoC",      _check_soc(df)),
+        ("Landing accuracy", _check_landing(df, tc)),
+        ("Rotor RPM symmetry", _check_rpm(df)),
+        ("Touchdown gz",     _check_gz(df)),
+    ]
+
+    n_pass = sum(1 for _,(ok,*_) in checks if ok)
+    n_fail = len(checks) - n_pass
+    verdict = "PASS ✅" if n_fail == 0 else "FAIL ❌"
+
+    dep  = tc.get("airport", {}).get("icao", "?")
+    arr  = tc.get("destination", {}).get("icao", "?")
+    dist = tc.get("_generated", {}).get("distance_km", "")
+    mission = f"{dep} → {arr}" + (f"  ({dist:.1f} km)" if dist else "")
+
+    plain(f"\n{'─'*60}\n  {mission}\n  {verdict}  ({n_pass}/{len(checks)} checks passed)\n{'─'*60}")
+    for name, (ok, detail, *_rest) in checks:
+        plain(f"  {'✅' if ok else '❌'} {name}\n       {detail}")
+    plain("")
+
+    if n_fail:
+        fail(f"{n_fail} check(s) failed")
+    return 0 if n_fail == 0 else 1
+
+
+# ── SQLite export ──────────────────────────────────────────────────────────────
+
+def _flatten_json(obj: dict, prefix: str = "", sep: str = "__") -> dict:
+    out: dict = {}
+    for k, v in obj.items():
+        full_key = f"{prefix}{sep}{k}" if prefix else k
+        if isinstance(v, dict):
+            out.update(_flatten_json(v, full_key, sep))
+        elif isinstance(v, list):
+            out[full_key] = json.dumps(v)
+        else:
+            out[full_key] = v
+    return out
+
+
+def export_sqlite(csv_path: Path, card_path: Path, out_dir: Path,
+                   rotor_rows: list[dict] | None = None) -> Path:
+    """Write a SQLite database alongside the CSV: test_parameters, rotor_config,
+    telemetry.
+
+    rotor_config is built from `rotor_rows` — the fleet actually used to plan
+    this run (session override or CSV, whichever is active) — rather than
+    re-reading rotor_config.csv from disk, so it always matches the card for
+    the run being exported, even when a session override is in effect.
+    """
+    import sqlite3
+    import pandas as pd
+
+    db_name = csv_path.stem + ".db"
+    db_path = out_dir / db_name
+    db_path.unlink(missing_ok=True)
+
+    info(f"Exporting SQLite: {db_path.name}")
+
+    def _safe(s: str) -> str:
+        return re.sub(r"[^\w]", "_", s)
+
+    with sqlite3.connect(db_path) as con:
+
+        if card_path.exists():
+            try:
+                card  = json.loads(card_path.read_text())
+                flat  = _flatten_json(card)
+                params_df = pd.DataFrame(
+                    [{_safe(k): (json.dumps(v) if isinstance(v, (list, dict)) else v)
+                      for k, v in flat.items()}]
+                )
+                params_df.to_sql("test_parameters", con, index=False, if_exists="replace")
+                success(f"  test_parameters: {len(params_df.columns)} columns")
+            except Exception as e:
+                warn(f"  test_parameters skipped: {e}")
+        else:
+            warn("  test_card.json not found — test_parameters table will be empty")
+            pd.DataFrame([{"note": "test_card.json not found"}]).to_sql(
+                "test_parameters", con, index=False, if_exists="replace")
+
+        try:
+            rows = rotor_rows if rotor_rows is not None else _read_rotor_rows_from_csv()
+            rotor_df = pd.DataFrame(rows)
+            rotor_df.columns = [_safe(c) for c in rotor_df.columns]
+            rotor_df.to_sql("rotor_config", con, index=False, if_exists="replace")
+            source_note = "session override" if rotor_rows is not None else "rotor_config.csv"
+            success(f"  rotor_config: {len(rotor_df)} rotors × {len(rotor_df.columns)} columns ({source_note})")
+        except Exception as e:
+            warn(f"  rotor_config skipped: {e}")
+
+        try:
+            df = pd.read_csv(csv_path, skipinitialspace=True)
+            df.columns = [_safe(c.strip()) for c in df.columns]
+            df.to_sql("telemetry", con, index=False, if_exists="replace")
+            success(f"  telemetry: {len(df)} rows × {len(df.columns)} columns")
+        except Exception as e:
+            warn(f"  telemetry table failed: {e}")
+            raise
+
+    success(f"SQLite DB: {db_path}")
+    return db_path
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  RunSpec / run_pipeline — the single entry point used by:
+#    - windblade.py --auto/--manual (headless, no GUI, no browser)
+#    - the GUI's Launch button (_run_sim, via the HTTP server)
+#  Never calls sys.exit()/os._exit() — always returns an int exit code, so the
+#  server thread that calls it doesn't die with the process.
+# ══════════════════════════════════════════════════════════════════════════════
+
+@dataclass
+class RunSpec:
+    mode:                str            = "auto"     # "auto" | "manual"
+    speed:               Optional[float] = None
+    gui:                 bool           = False
+    terrain:             bool           = False
+    no_build:            bool           = False
+    no_plan:             bool           = False
+    db:                  bool           = False
+    out_dir:             Path           = field(default_factory=lambda: ROOT)
+    csv:                 Optional[Path] = None
+    dep_metar:           Optional[str]  = None
+    arr_metar:           Optional[str]  = None
+    speed_kmh:           Optional[float] = None
+    altitude_ft:         Optional[float] = None
+    hover_alt_m:         Optional[float] = None
+    back_trans_speed_ms: Optional[float] = None
+    nacelle_tilt_deg:    Optional[float] = None
+    turb_intensity_ms:   Optional[float] = None   # explicit override (CLI --turb-intensity)
+    auto_turb:           bool           = False   # GUI toggle: derive from dep METAR wind
+    interactive:         bool           = True    # False ⇒ get_airport never calls input()
+    rotor_rows:          Optional[list] = None    # None ⇒ read rotor_config.csv
+
+
+def run_pipeline(spec: RunSpec) -> int:
+    """plan → build → simulate → analyse. Returns the exit code. Never exits
+    the process — safe to call from a daemon thread."""
+    out_dir = Path(spec.out_dir).resolve()
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    try:
+        cfg = DashConfig.load()
+    except Exception as e:
+        fail(str(e)); return 4
+
+    if spec.speed_kmh           is not None: cfg.speed_kmh               = spec.speed_kmh
+    if spec.altitude_ft         is not None: cfg.altitude_ft             = spec.altitude_ft
+    if spec.hover_alt_m         is not None: cfg.hover_alt_m             = spec.hover_alt_m
+    if spec.back_trans_speed_ms is not None: cfg.back_trans_speed_ms     = spec.back_trans_speed_ms
+    if spec.nacelle_tilt_deg    is not None: cfg.nacelle_tilt_deg        = spec.nacelle_tilt_deg
+    if spec.turb_intensity_ms   is not None:
+        cfg.turbulence_intensity_ms = spec.turb_intensity_ms
+    elif spec.auto_turb and spec.dep_metar:
+        wind_ms = _metar_wind_speed_ms(spec.dep_metar)
+        turb = round(0.1 * wind_ms, 3)
+        if turb > 0:
+            cfg.turbulence_intensity_ms = turb
+            info(f"Dryden turbulence: dep wind {wind_ms:.1f} m/s -> intensity {turb} m/s")
+
+    # Resolve rotor rows once, up front, so planning and the post-run SQLite
+    # export agree on exactly what fleet was used for this run.
+    rotor_rows = spec.rotor_rows
+    rotor_source = "session override" if rotor_rows is not None else "rotor_config.csv"
+    if rotor_rows is None:
+        rotor_rows = _read_rotor_rows_from_csv()
+    if spec.rotor_rows is not None:
+        info(f"Rotor fleet: {len(rotor_rows)} rotor(s) from session override "
+             f"(rotor_config.csv on disk is unchanged)")
+
+    card_path = PLANNING / "test_card.json"
+    csv_path: Optional[Path] = Path(spec.csv).resolve() if spec.csv else None
+    exit_code = 0
+    dep_lbl = arr_lbl = "?"
+
+    # ── 1: Plan ───────────────────────────────────────────────────────
+    header("Flight planning")
+    if not spec.no_plan and not spec.csv:
+        try:
+            card_path = plan_flight(cfg, spec.terrain,
+                                     dep_metar=spec.dep_metar,
+                                     arr_metar=spec.arr_metar,
+                                     rotor_rows=rotor_rows,
+                                     interactive=spec.interactive)
+        except Exception as e:
+            if card_path.exists():
+                warn(f"Planning failed ({e}) — using existing test_card.json")
+            else:
+                fail(f"Planning failed: {e}"); return 4
+    elif spec.csv:
+        info("csv mode: skipping planning")
+    else:
+        if not card_path.exists():
+            fail("test_card.json not found — run without no_plan first"); return 4
+        info(f"no_plan: using {card_path}")
+        # Still respect a session rotor override on a no-plan run: patch the
+        # existing card's rotor_fleet block in place so the sim sees it, same
+        # as the immediate patch POST /rotors already applies — this covers
+        # the case where the override was set *after* the card was written by
+        # some earlier run and the user now launches with "skip planning".
+        if spec.rotor_rows is not None:
+            try:
+                d = json.loads(card_path.read_text())
+                d["rotor_fleet"] = _rotor_fleet_overrides(rotor_rows)
+                card_path.write_text(json.dumps(d, indent=2))
+                info("Patched existing test_card.json with session rotor override")
+            except Exception as e:
+                warn(f"Could not patch test_card.json with rotor override: {e}")
+
+    if card_path.exists():
+        try:
+            d = json.loads(card_path.read_text())
+            dep_lbl = d.get("airport",     {}).get("icao", "?")
+            arr_lbl = d.get("destination", {}).get("icao", "?")
+        except Exception:
+            pass
+    success(f"{dep_lbl} → {arr_lbl} | {cfg.speed_kmh:.0f} km/h | {cfg.altitude_ft:.0f} ft "
+            f"| rotors: {rotor_source}")
+
+    # ── 2: Build ──────────────────────────────────────────────────────
+    if not spec.csv:
+        header("Building")
+        if not spec.no_build:
+            try:
+                build_autopilot()
+            except Exception as e:
+                fail(str(e)); return 2
+        else:
+            def _ver_label(version_file: Path, glob_name: str) -> str:
+                vf = version_file
+                if vf.exists():
+                    return f"{glob_name}_{vf.read_text().strip()}.so"
+                existing = sorted(vf.parent.glob(f"{glob_name}_*.so"),
+                                  key=lambda p: p.stat().st_mtime, reverse=True)
+                return existing[0].name if existing else f"{glob_name}.so (no version file)"
+            info(f"no_build: {_ver_label(CONTROLS/'autopilot.version', 'autopilot')}")
+
+    # ── 3: Simulate ───────────────────────────────────────────────────
+    manual = (spec.mode == "manual")
+    gui    = manual or spec.gui
+    if not spec.csv:
+        header(f"{'Auto' if spec.mode == 'auto' else 'Manual'} flight: {dep_lbl} → {arr_lbl}")
+        if manual:
+            info("Cockpit launching. Fly the aircraft. Stop/Ctrl+C ends and generates a report.")
+        try:
+            csv_path = run_simulation(gui, manual, spec.speed, out_dir)
+        except KeyboardInterrupt:
+            # CLI Ctrl+C path (windblade.py --auto/--manual run from a real terminal).
+            warn("Ctrl+C received — stopping simulation")
+            candidates = sorted(out_dir.glob("dash_results_*.csv"),
+                                key=lambda p: p.stat().st_mtime, reverse=True)
+            if not candidates:
+                candidates = sorted(ROOT.glob("dash_results_*.csv"),
+                                    key=lambda p: p.stat().st_mtime, reverse=True)
+            if candidates:
+                csv_path = candidates[0]
+                success(f"Using CSV: {csv_path}")
+            else:
+                fail("No CSV found after Ctrl+C — simulation may not have started")
+                return 3
+        except Exception as e:
+            fail(str(e)); return 3
+    else:
+        if not csv_path.exists():
+            fail(f"csv: file not found: {csv_path}"); return 3
+        info(f"csv mode: {csv_path}")
+
+    # ── 4: Analyse ────────────────────────────────────────────────────
+    header("Analysis")
+    if csv_path:
+        try:
+            exit_code = run_analysis(csv_path, card_path, out_dir)
+        except Exception as e:
+            warn(f"Analysis error: {e}")
+
+        if spec.db:
+            try:
+                export_sqlite(csv_path, card_path, out_dir, rotor_rows=rotor_rows)
+            except Exception as e:
+                warn(f"SQLite export failed: {e}")
+
+    # ── Summary ───────────────────────────────────────────────────────
+    header("Summary")
+    mode_label = "AUTO" if spec.mode == "auto" else "MANUAL"
+    plain(f"  {'Mode:':<14} {mode_label}")
+    plain(f"  {'Route:':<14} {dep_lbl} → {arr_lbl}")
+    plain(f"  {'Speed:':<14} {cfg.speed_kmh:.0f} km/h")
+    plain(f"  {'Altitude:':<14} {cfg.altitude_ft:.0f} ft MSL")
+    plain(f"  {'Rotors:':<14} {rotor_source}")
+    if csv_path:
+        plain(f"  {'CSV:':<14} {csv_path}")
+    if spec.db and csv_path:
+        db_candidate = out_dir / (csv_path.stem + ".db")
+        if db_candidate.exists():
+            plain(f"  {'SQLite DB:':<14} {db_candidate}")
+    if spec.speed:
+        plain(f"  {'Sim speed:':<14} {spec.speed}×")
+    plain(f"  {'Exit code:':<14} {exit_code}\n")
+    return exit_code
+
+
+# ── CLI parser for windblade.py's own headless invocation. --auto/--manual
+#    are optional here — omitting both just means "open the GUI instead".
+#    See main().  ────────────────────────────────────────────────────────────
+
+def _add_pipeline_args(p: argparse.ArgumentParser) -> None:
+    mode = p.add_mutually_exclusive_group(required=False)
+    mode.add_argument("--auto",   action="store_true",
+                      help="Autonomous flight: plan → build → simulate → analyse")
+    mode.add_argument("--manual", action="store_true",
+                      help="Manual HOTAS flight with cockpit. Ctrl+C stops the sim.")
+    p.add_argument("--speed",    type=float, default=None, metavar="X")
+    p.add_argument("--gui",      action="store_true")
+    p.add_argument("--terrain",  action="store_true")
+    p.add_argument("--no-plan",  action="store_true")
+    p.add_argument("--no-build", action="store_true")
+    p.add_argument("--out",      default=str(ROOT), metavar="DIR")
+    p.add_argument("--csv",      default=None, metavar="PATH")
+    p.add_argument("--db",       action="store_true")
+    p.add_argument("--dep-metar", default=None, metavar="METAR")
+    p.add_argument("--arr-metar", default=None, metavar="METAR")
+    p.add_argument("--speed-kmh", type=float, default=None, metavar="KMH")
+    p.add_argument("--alt-ft",    type=float, default=None, metavar="FT")
+    p.add_argument("--hover-m",   type=float, default=None, metavar="M")
+    p.add_argument("--turb-intensity", type=float, default=None, metavar="MS")
+    p.add_argument("--bt-speed-ms",    type=float, default=None, metavar="MS")
+    p.add_argument("--nacelle-tilt-deg", type=float, default=None, metavar="DEG")
+
+
+def spec_from_args(args: argparse.Namespace) -> RunSpec:
+    if args.speed is not None and args.manual:
+        fail("--speed is not valid with --manual (manual mode always runs at realtime)")
+        sys.exit(1)
+    if args.speed is not None and args.gui:
+        fail("--speed and --gui are mutually exclusive (GUI throttles the sim)")
+        sys.exit(1)
+    return RunSpec(
+        mode="manual" if args.manual else "auto",
+        speed=args.speed, gui=args.gui, terrain=args.terrain,
+        no_build=args.no_build, no_plan=args.no_plan, db=args.db,
+        out_dir=Path(args.out), csv=Path(args.csv) if args.csv else None,
+        dep_metar=args.dep_metar, arr_metar=args.arr_metar,
+        speed_kmh=args.speed_kmh, altitude_ft=args.alt_ft, hover_alt_m=args.hover_m,
+        back_trans_speed_ms=args.bt_speed_ms, nacelle_tilt_deg=args.nacelle_tilt_deg,
+        turb_intensity_ms=args.turb_intensity,
+        interactive=True,       # CLI has a real TTY — input() fallback stays available
+        rotor_rows=None,        # CLI always reads rotor_config.csv; no session concept
+    )
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-#  Results plotting  (ported from plot_test_flight.py — kept inline so
-#  windblade.py stays a single-file entry point; see module docstring)
+#  Results plotting — kept inline so windblade.py stays a single-file
+#  entry point
 # ═════════════════════════════════════════════════════════════════════════════
 
-# Default columns rendered to the Last Results tab after every run —
-# overridable per-run from the Parameters tab (Plots section).
 DEFAULT_PLOT_COLUMNS = ["altitude_msl_ft", "speed_kmh"]
 
-# Friendly axis labels for common telemetry columns; anything else falls
-# back to a title-cased version of the raw column name.
 _PLOT_LABELS = {
     "altitude_msl_ft": "Altitude (ft MSL)",
     "speed_kmh":        "Speed (km/h)",
@@ -264,8 +1505,6 @@ def _make_flight_plot(df, y_col: str, y_label: str, out_path: Path) -> None:
     plt.close(fig)
 
 def _generate_plots(df, out_dir: Path, columns: list[str]) -> dict[str, str]:
-    """Render PNGs for the requested columns into out_dir.
-    Returns {column: filename} for whichever columns were present."""
     if "timestamp_s" not in df.columns:
         return {}
     plots = {}
@@ -282,8 +1521,6 @@ def _generate_plots(df, out_dir: Path, columns: list[str]) -> dict[str, str]:
     return plots
 
 def _compute_flight_metrics(df) -> dict:
-    """Summary stats parsed straight from the same results CSV used for the
-    plots: flight time, range from origin, energy used, arrival SoC."""
     m: dict = {}
     if "timestamp_s" in df.columns and len(df):
         m["flight_time_s"] = round(float(df["timestamp_s"].max()), 1)
@@ -292,10 +1529,9 @@ def _compute_flight_metrics(df) -> dict:
         y_m = abs(float(df["y_m"].iloc[-1]))
         m["distance_km"] = round(((x_m ** 2 + y_m ** 2) ** 0.5) / 1000.0, 2)
     if "power_kw" in df.columns and "timestamp_s" in df.columns and len(df) > 1:
-        import numpy as np
         t = df["timestamp_s"].to_numpy(dtype=float)
         p = df["power_kw"].to_numpy(dtype=float)
-        energy_kj = float(np.sum(np.diff(t) * (p[:-1] + p[1:]) / 2.0))  # kW·s = kJ
+        energy_kj = float(np.sum(np.diff(t) * (p[:-1] + p[1:]) / 2.0))
         m["energy_mj"] = round(energy_kj / 1000.0, 2)
     if "soc_pct" in df.columns and len(df):
         m["arrival_soc_pct"] = round(float(df["soc_pct"].iloc[-1]), 1)
@@ -303,8 +1539,6 @@ def _compute_flight_metrics(df) -> dict:
 
 def _process_results_csv(csv_path: Path, out_dir: Path,
                           columns: list[str]) -> tuple[dict, dict]:
-    """Load csv_path once; render plots for `columns` and compute summary
-    metrics from the same DataFrame. Returns (plots, metrics)."""
     try:
         df = _load_flight_csv(csv_path)
     except Exception as e:
@@ -368,11 +1602,17 @@ html,body{background:var(--bg);color:var(--nw);font-family:var(--mono);font-size
 .switch.on{background:var(--ga);border-color:var(--ga)}
 .switch::after{content:'';position:absolute;width:20px;height:20px;border-radius:50%;background:var(--bg);top:3px;left:3px;transition:.15s}
 .switch.on::after{left:29px}
-.data-table{width:100%;border-collapse:collapse;font-size:20px;margin-bottom:20px}
-.data-table th{text-align:left;font-size:17px;letter-spacing:.07em;color:var(--dim);text-transform:uppercase;padding:0 12px 8px;border-bottom:1px solid var(--stroke-hi)}
-.data-table td{padding:9px 12px;border-bottom:1px solid var(--stroke);color:var(--nw)}
+.data-table{width:100%;border-collapse:collapse;font-size:18px;margin-bottom:20px}
+.data-table th{text-align:left;font-size:15px;letter-spacing:.06em;color:var(--dim);text-transform:uppercase;padding:0 8px 8px;border-bottom:1px solid var(--stroke-hi)}
+.data-table td{padding:6px 8px;border-bottom:1px solid var(--stroke);color:var(--nw)}
 .data-table tr:last-child td{border-bottom:none}
 .data-table tr:hover td{background:var(--hi)}
+.data-table input,.data-table select{background:var(--panel);border:1px solid var(--stroke-hi);border-radius:2px;padding:4px 6px;font-size:16px;font-family:var(--mono);color:var(--nw);width:100%;height:34px}
+.data-table input[type=number]{-moz-appearance:textfield;appearance:textfield}
+.data-table input[type=number]::-webkit-outer-spin-button,
+.data-table input[type=number]::-webkit-inner-spin-button{-webkit-appearance:none;margin:0}
+.data-table input.err{border-color:var(--rd);color:var(--rd)}
+.data-table input[type=checkbox]{width:auto;height:auto;accent-color:var(--ga)}
 .c-ok{color:var(--ga)}.c-warn{color:var(--yl)}.c-fail{color:var(--rd)}.c-dim{color:var(--dim)}
 .callout{border-left:3px solid var(--bl);padding:14px 18px;background:var(--panel);font-size:20px;color:var(--dim);margin-bottom:20px;line-height:1.7}
 .callout.ok{border-color:var(--ga)}.callout.warn{border-color:var(--yl)}
@@ -388,6 +1628,8 @@ html,body{background:var(--bg);color:var(--nw);font-family:var(--mono);font-size
 .btn{padding:12px 22px;border-radius:2px;font-size:22px;font-family:var(--mono);cursor:pointer;border:1px solid var(--stroke-hi);background:transparent;color:var(--nw);transition:all .12s;display:flex;align-items:center;gap:10px}
 .btn:hover{background:var(--hi)}.btn:disabled{opacity:.35;cursor:default}
 .btn.primary{border-color:var(--ga);color:var(--ga)}.btn.primary:hover{background:var(--faint)}
+.btn.danger{border-color:var(--rd);color:var(--rd)}.btn.danger:hover{background:#2a0000}
+.btn.small{padding:6px 12px;font-size:16px}
 #launch-log{background:var(--panel);border:1px solid var(--stroke-hi);border-radius:2px;padding:16px 20px;font-size:20px;font-family:var(--mono);line-height:1.8;min-height:200px;max-height:50vh;overflow-y:auto;white-space:pre-wrap;color:var(--dim)}
 #launch-log .ga{color:var(--ga)}#launch-log .yl{color:var(--yl)}
 #launch-log .rd{color:var(--rd)}#launch-log .nw{color:var(--nw)}
@@ -451,7 +1693,7 @@ html,body{background:var(--bg);color:var(--nw);font-family:var(--mono);font-size
         <label>METAR_ARR</label>
         <textarea id="arr-metar" rows="3" oninput="sync()">KSAF 151153Z 24005KT 10SM CLR 13/M09 A3005 RMK AO2 T01281094</textarea>
       </div>
-      <div class="callout" style="margin-top:20px">Paste real METARs here — passed directly to <code>test_flight.py</code> via <code>--dep-metar</code> / <code>--arr-metar</code>. No planning/ files are written. The ICAO code is read from the first token.</div>
+      <div class="callout" style="margin-top:20px">Paste real METARs here — passed directly into the flight engine. No planning/ files are written for weather. The ICAO code is read from the first token.</div>
     </div>
 
     <!-- Flight params -->
@@ -511,20 +1753,24 @@ html,body{background:var(--bg);color:var(--nw);font-family:var(--mono);font-size
         <div class="switch" id="sw-noplan" onclick="tog(this,'noplan')"></div>
       </div>
       <div class="toggle-row">
-        <div><div class="tl">Export SQLite DB</div><div class="ts">Write dash_results_&lt;ts&gt;.db alongside the CSV (test_parameters + telemetry tables)</div></div>
+        <div><div class="tl">Export SQLite DB</div><div class="ts">Write dash_results_&lt;ts&gt;.db alongside the CSV (test_parameters + rotor_config + telemetry tables)</div></div>
         <div class="switch" id="sw-db" onclick="tog(this,'db')"></div>
       </div>
     </div>
 
     <!-- Rotor config -->
     <div class="panel" id="panel-rotors">
-      <div class="sec">Fleet — <span id="rotor-csv-path" style="color:var(--faint)"></span></div>
+      <div class="sec">Source — <span id="rotor-csv-path" style="color:var(--faint)"></span></div>
       <div id="rotor-fleet-error" style="display:none" class="callout" style="border-color:var(--rd);color:var(--rd)"></div>
+      <div id="rotor-warnings"></div>
       <table class="data-table" id="rotor-table">
-        <thead><tr><th>#</th><th>Position</th><th>R (m)</th><th>Blades</th><th>Chord (m)</th><th>Twist root</th><th>P max (kW)</th><th>RPM hover</th><th>Propulsion</th><th>Mode</th><th>Notes</th></tr></thead>
-        <tbody id="rotor-tbody"><tr><td colspan="11" class="c-dim" style="padding:12px 8px">Loading...</td></tr></tbody>
+        <thead><tr><th>#</th><th>Position</th><th>R (m)</th><th>Blades</th><th>Chord (m)</th><th>Twist root</th><th>Twist tip</th><th>Pitch offset</th><th>P max (kW)</th><th>RPM hover</th><th>Propulsion</th><th>Lift</th><th>Thrust</th><th>Notes</th></tr></thead>
+        <tbody id="rotor-tbody"><tr><td colspan="14" class="c-dim" style="padding:12px 8px">Loading...</td></tr></tbody>
       </table>
-      <p class="path-note">Edit <code>subsystems/propulsion/rotor_config.csv</code> and click the Rotor Config tab again to reload.</p>
+      <div class="actions">
+        <button class="btn primary" onclick="updateRotors()">&#8635; Update (this run only)</button>
+        <button class="btn danger small" onclick="resetRotors()">Reset to CSV</button>
+      </div>
       <div id="rotor-disks" style="margin-top:24px"></div>
     </div>
 
@@ -536,6 +1782,7 @@ html,body{background:var(--bg);color:var(--nw);font-family:var(--mono);font-size
       <div id="checklist"></div>
       <div class="actions" style="margin-top:20px">
         <button class="btn primary" id="btn-launch" onclick="doLaunch()">&#9654; Launch simulation</button>
+        <button class="btn danger" id="btn-stop" onclick="doStop()" disabled>&#9632; Stop</button>
       </div>
       <div class="sec" style="margin-top:24px">Terminal output</div>
       <div id="launch-log">Waiting for launch...</div>
@@ -571,9 +1818,12 @@ html,body{background:var(--bg);color:var(--nw);font-family:var(--mono);font-size
 var sw={terrain:false,nobuild:false,noplan:false,gui:false,db:false,turb:false};
 var running=false;
 var rotorData=[];
+var rotorBaseline={};
+var rotorPowerplants=["electric","turbine_electric","turboshaft"];
+var rotorLocked=false;
+var rotorSource='csv';
 
 var POSITIONS=['fwd-port','fwd-stbd','mid-port','mid-stbd','aft-port','aft-stbd'];
-var S4={R_m:1.45,n_blades:5,chord_m:0.096,twist_root_deg:16.0,twist_tip_deg:6.0,pitch_offset_deg:4.4,P_max_kW:280,rpm_hover:1260};
 
 function nav(id,el){
   document.querySelectorAll('.panel').forEach(p=>p.classList.remove('active'));
@@ -594,14 +1844,13 @@ function v(id){return document.getElementById(id).value.trim();}
 
 function buildCmd(){
   var mode=v('mode'),sf=v('sfactor');
-  var parts=['python3 test_flight.py','--'+mode];
+  var parts=['python3 windblade.py','--'+mode];
   if(mode==='auto'&&sf!=='1'&&!sw.gui)parts.push('--speed '+sf);
   if(sw.gui&&mode==='auto')parts.push('--gui');
   if(sw.terrain)parts.push('--terrain');
   if(sw.nobuild)parts.push('--no-build');
   if(sw.noplan)parts.push('--no-plan');
   if(sw.db)parts.push('--db');
-  
   return parts.join(' ');
 }
 
@@ -619,19 +1868,20 @@ function loadRotors(){
     .then(r=>r.json())
     .then(data=>{
       rotorData=data.rotors||[];
+      rotorBaseline=data.baseline||{};
+      rotorPowerplants=data.powerplants||rotorPowerplants;
+      rotorLocked=!!data.locked;
+      rotorSource=data.source||'csv';
       var n=rotorData.length;
       var err=data.error||null;
-      // Show/hide fleet error banner
       var errEl=document.getElementById('rotor-fleet-error');
       if(err){
         errEl.textContent=err;
         errEl.style.display='block';
-        errEl.style.borderColor='var(--rd)';
-        errEl.style.color='var(--rd)';
       } else {
         errEl.style.display='none';
       }
-      renderRotorTable(rotorData);
+      renderRotorTable();
       renderRotorDisks(rotorData);
       document.getElementById('rotor-csv-path').textContent=data.path||'';
       if(err){
@@ -642,7 +1892,7 @@ function loadRotors(){
         document.getElementById('rotor-badge').className='badge warn';
       } else {
         document.getElementById('rotor-badge').textContent=n+' rotor'+(n!==1?'s':'')+' loaded';
-        document.getElementById('rotor-badge').className='badge ok';
+        document.getElementById('rotor-badge').className='badge '+(rotorSource==='session'?'warn':'ok');
       }
     })
     .catch(()=>{
@@ -658,11 +1908,6 @@ function propCls(t){
   return '';
 }
 
-// TILT = tiltrotor, LIFT = lift-only (never tilts, runs in cruise as needed),
-// THRUST = fixed pusher (powers up during transition), OFF = out of service
-// (no lift, no thrust, weight and moment still carried).
-// Preflight one-liner: how the fleet is configured, so an unintended OFF or a
-// forgotten pusher shows up on the checklist rather than in the telemetry.
 function fleetModeSummary(){
   if(!rotorData.length)return '';
   var c={TILT:0,LIFT:0,THRUST:0,OFF:0};
@@ -672,57 +1917,131 @@ function fleetModeSummary(){
   return parts.length?'  ('+parts.join(', ')+')':'';
 }
 
-function modeCls(m){
-  if(m==='LIFT')return 'c-ok';
-  if(m==='THRUST')return 'c-warn';
-  if(m==='OFF')return 'c-dim';
-  return '';
+function computeMode(lift,thrust){
+  if(lift&&thrust)return 'TILT';
+  if(lift)return 'LIFT';
+  if(thrust)return 'THRUST';
+  return 'OFF';
 }
 
-function renderRotorTable(rotors){
+function diffCls(field,val){
+  var base=rotorBaseline[field];
+  if(base===undefined)return '';
+  return Math.abs(parseFloat(val)-base)>0.001 ? 'c-warn' : '';
+}
+
+// Rebuild the whole editable table from rotorData. Each input writes straight
+// back into rotorData[i][field] on change, so Update always posts current
+// on-screen state, not a stale snapshot from load time.
+function renderRotorTable(){
   var tbody=document.getElementById('rotor-tbody');
+  var rotors=rotorData;
   if(!rotors.length){
-    tbody.innerHTML='<tr><td colspan="11" class="c-warn" style="padding:12px 8px">rotor_config.csv not found or empty</td></tr>';
+    tbody.innerHTML='<tr><td colspan="14" class="c-warn" style="padding:12px 8px">no rotors loaded</td></tr>';
     return;
   }
-  tbody.innerHTML=rotors.map((r,i)=>{
+  var opts=rotorPowerplants.map(function(p){return '<option value="'+p+'">'+p+'</option>';}).join('');
+  tbody.innerHTML=rotors.map(function(r,i){
     var pos=POSITIONS[i]||'pos-'+i;
-    var rc=Math.abs(r.R_m-S4.R_m)>0.001?'c-warn':'';
-    var pc=Math.abs(r.P_max_kW-S4.P_max_kW)>0.1?'c-warn':'';
-    var rpc=Math.abs(r.rpm_hover-S4.rpm_hover)>1?'c-warn':'';
-    var pt=r.powerplant||'electric';
-    return '<tr>'
-      +'<td class="c-dim">'+r.rotor_id+'</td>'
-      +'<td>'+pos+'</td>'
-      +'<td class="'+rc+'">'+r.R_m.toFixed(3)+'</td>'
-      +'<td>'+r.n_blades+'</td>'
-      +'<td>'+r.chord_m.toFixed(3)+'</td>'
-      +'<td>'+r.twist_root_deg.toFixed(1)+'&deg;</td>'
-      +'<td class="'+pc+'">'+r.P_max_kW.toFixed(0)+'</td>'
-      +'<td class="'+rpc+'">'+r.rpm_hover.toFixed(0)+'</td>'
-      +'<td class="'+propCls(pt)+'">'+pt+'</td>'
-      +'<td class="'+modeCls(r.mode)+'">'+(r.mode||'TILT')+'</td>'
-      +'<td class="c-dim">'+r.notes+'</td>'
+    function numInput(field,step){
+      return '<input type="number" step="'+(step||'any')+'" value="'+r[field]+'" class="'+diffCls(field,r[field])+'" '
+        +'onchange="onRotorField('+i+',\''+field+'\',this.value,false)" '+(rotorLocked?'disabled':'')+'>';
+    }
+    var ppOpts=rotorPowerplants.map(function(p){
+      return '<option value="'+p+'"'+(p===r.powerplant?' selected':'')+'>'+p+'</option>';
+    }).join('');
+    return '<tr data-i="'+i+'">'
+      +'<td class="c-dim">'+numInput('rotor_id')+'</td>'
+      +'<td class="c-dim">'+pos+'</td>'
+      +'<td>'+numInput('R_m','0.001')+'</td>'
+      +'<td>'+numInput('n_blades','1')+'</td>'
+      +'<td>'+numInput('chord_m','0.001')+'</td>'
+      +'<td>'+numInput('twist_root_deg','0.1')+'</td>'
+      +'<td>'+numInput('twist_tip_deg','0.1')+'</td>'
+      +'<td>'+numInput('pitch_offset_deg','0.1')+'</td>'
+      +'<td>'+numInput('P_max_kW','1')+'</td>'
+      +'<td>'+numInput('rpm_hover','1')+'</td>'
+      +'<td><select onchange="onRotorField('+i+',\'powerplant\',this.value,false)" '+(rotorLocked?'disabled':'')+'>'+ppOpts+'</select></td>'
+      +'<td><input type="checkbox" '+(r.lift?'checked':'')+' onchange="onRotorField('+i+',\'lift\',this.checked,true)" '+(rotorLocked?'disabled':'')+'></td>'
+      +'<td><input type="checkbox" '+(r.thrust?'checked':'')+' onchange="onRotorField('+i+',\'thrust\',this.checked,true)" '+(rotorLocked?'disabled':'')+'></td>'
+      +'<td><input type="text" value="'+(r.notes||'').replace(/"/g,'&quot;')+'" '
+        +'onchange="onRotorField('+i+',\'notes\',this.value,false)" '+(rotorLocked?'disabled':'')+'></td>'
       +'</tr>';
   }).join('');
 }
 
-// ── Inline rotor disk SVGs (outline style, NVG palette) ──────────────
-// All tiles share the same pixel footprint (tileSize). The SVG coordinate
-// space is anchored to the fleet's largest rotor (R_max), so each disk
-// renders proportionally smaller if its R_m is below the fleet maximum.
+function onRotorField(i,field,val,isBool){
+  if(isBool){
+    rotorData[i][field]=!!val;
+  } else if(field==='notes'||field==='powerplant'){
+    rotorData[i][field]=val;
+  } else {
+    rotorData[i][field]=parseFloat(val);
+  }
+  if(field==='lift'||field==='thrust'){
+    rotorData[i].mode=computeMode(rotorData[i].lift,rotorData[i].thrust);
+  }
+  renderRotorTable();   // re-render so diff-highlighting and mode stay current
+}
+
+function updateRotors(){
+  var errEl=document.getElementById('rotor-fleet-error');
+  var warnEl=document.getElementById('rotor-warnings');
+  fetch('/rotors',{method:'POST',headers:{'Content-Type':'application/json'},
+                  body:JSON.stringify({rotors:rotorData})})
+    .then(function(r){ return r.json().then(function(d){ return {ok:r.ok,d:d}; }); })
+    .then(function(res){
+      if(!res.ok){
+        var errs=(res.d.errors||[]).map(function(e){
+          return 'row '+(e.row!=null?e.row+1:'?')+' · '+e.field+': '+e.message;
+        });
+        errEl.innerHTML=errs.length?errs.join('<br>'):(res.d.message||'update rejected');
+        errEl.style.display='block';
+        return;
+      }
+      errEl.style.display='none';
+      rotorData=res.d.rotors||rotorData;
+      rotorSource='session';
+      warnEl.innerHTML=(res.d.warnings||[]).map(function(w){
+        return '<div class="callout warn">'+w+'</div>';
+      }).join('');
+      renderRotorTable();
+      renderRotorDisks(rotorData);
+      var badge=document.getElementById('rotor-badge');
+      badge.textContent=rotorData.length+' rotor'+(rotorData.length!==1?'s':'')+' loaded'
+        +(res.d.card_patched?' · card patched':' · no test_card.json yet');
+      badge.className='badge warn';
+      document.getElementById('statusbar').innerHTML='Rotor fleet updated<br>rotor_config.csv unchanged';
+      renderChecklist();
+    })
+    .catch(function(e){
+      errEl.textContent='update failed: '+e;
+      errEl.style.display='block';
+    });
+}
+
+function resetRotors(){
+  fetch('/rotors',{method:'POST',headers:{'Content-Type':'application/json'},
+                  body:JSON.stringify({reset:true})})
+    .then(function(r){return r.json();})
+    .then(function(d){
+      document.getElementById('rotor-fleet-error').style.display='none';
+      document.getElementById('rotor-warnings').innerHTML='';
+      loadRotors();
+      document.getElementById('statusbar').textContent='rotor fleet reverted to rotor_config.csv';
+    });
+}
+
 function buildDiskSVG(r, tileSize, R_max){
-  var LABEL_H = 22;    // px reserved at bottom for the R label (outside disk area)
-  var PAD     = 6;     // px margin above and on sides
+  var LABEL_H = 22;
+  var PAD     = 6;
   var S = tileSize || 160;
-  var drawH = S - LABEL_H;          // vertical space available for the disk
-  // Disk centre sits in the middle of the draw area, with top/side padding
+  var drawH = S - LABEL_H;
   var cx = S / 2;
   var cy = PAD + (drawH - PAD) / 2;
-  // Maximum disk radius: largest rotor just touches the margins
   var maxDiskPx = Math.min(S/2 - PAD, (drawH - PAD) / 2) * 0.96;
   var R_m = r.R_m || 1.45;
-  var R = maxDiskPx * (R_m / R_max);   // proportional disk radius
+  var R = maxDiskPx * (R_m / R_max);
   var hubR = R * 0.18;
   var nb = r.n_blades || 6;
   var chordRoot = r.chord_m || 0.096;
@@ -742,10 +2061,10 @@ function buildDiskSVG(r, tileSize, R_max){
       var offset = side===1 ? c_px/4 : -3*c_px/4;
       return [(cx + r_px*ca - offset*sa), (cy + r_px*sa + offset*ca)];
     }
-    var p0 = pt2(hubR, cRpx,  1);   // root LE
-    var p1 = pt2(R,    cTpx,  1);   // tip LE
-    var p2 = pt2(R,    cTpx, -1);   // tip TE
-    var p3 = pt2(hubR, cRpx, -1);   // root TE
+    var p0 = pt2(hubR, cRpx,  1);
+    var p1 = pt2(R,    cTpx,  1);
+    var p2 = pt2(R,    cTpx, -1);
+    var p3 = pt2(hubR, cRpx, -1);
     var hw = Math.sqrt((p1[0]-p2[0])**2 + (p1[1]-p2[1])**2) / 2;
     var d = 'M'+p0[0].toFixed(1)+','+p0[1].toFixed(1)
           + ' L'+p1[0].toFixed(1)+','+p1[1].toFixed(1)
@@ -754,9 +2073,7 @@ function buildDiskSVG(r, tileSize, R_max){
     blades += '<path d="'+d+'" fill="none" stroke="'+diskColor+'" stroke-width="'+strokeW+'" stroke-linejoin="round"/>';
   }
 
-  // Disk outline — dashed circle at actual R (not maxDiskPx)
   var disk = '<circle cx="'+cx+'" cy="'+cy+'" r="'+R.toFixed(1)+'" fill="none" stroke="#2e4432" stroke-width="0.8" stroke-dasharray="3,3"/>';
-  // R_max reference ring (faint) so the relative scale is visually legible
   var refRing = R < maxDiskPx
     ? '<circle cx="'+cx+'" cy="'+cy+'" r="'+maxDiskPx.toFixed(1)+'" fill="none" stroke="#1a2a1a" stroke-width="0.5" stroke-dasharray="1,4"/>'
     : '';
@@ -772,9 +2089,7 @@ function renderRotorDisks(rotors){
   var el = document.getElementById('rotor-disks');
   if(!rotors.length){ el.innerHTML=''; return; }
   var n = rotors.length;
-  // Fleet-wide max radius — sets the common scale reference
   var R_max = Math.max.apply(null, rotors.map(function(r){ return r.R_m || 1.45; }));
-  // ≤6 rotors: single row; >6: wrap at 4 columns
   var cols = n<=6 ? n : 4;
   var tileSize = n<=6 ? Math.min(170, Math.floor(900/n)) : 150;
   var html = '<div style="display:grid;grid-template-columns:repeat('+cols+','+tileSize+'px);gap:12px;margin-top:12px">';
@@ -791,8 +2106,9 @@ function renderChecklist(){
     ['ARR',    v('arr-metar').substring(0,65), 'var(--ga)'],
     ['CRUISE', v('speed')+' km/h  /  '+v('alt')+' ft MSL  /  hover '+v('hover')+' m', 'var(--ga)'],
     ['MODE',   v('mode').toUpperCase()+'  x'+v('sfactor'), 'var(--ga)'],
-    ['ROTORS', rotorData.length+' rotors loaded from rotor_config.csv'+fleetModeSummary(), rotorData.length?'var(--ga)':'var(--yl)'],
-
+    ['ROTORS', rotorData.length+' rotors'+fleetModeSummary()+' — '+
+               (rotorSource==='session'?'session override':'rotor_config.csv'),
+               rotorData.length?'var(--ga)':'var(--yl)'],
   ];
   document.getElementById('checklist').innerHTML=rows.map(([l,d,c])=>
     '<div class="chk-row"><span style="color:'+c+';font-size:22px;min-width:140px">'+l+'</span>'
@@ -815,7 +2131,6 @@ function getConfig(){
     sim:{mode:v('mode'),speed_factor:parseInt(v('sfactor'))||1,
          terrain:sw.terrain,no_build:sw.nobuild,no_plan:sw.noplan,gui:sw.gui,db:sw.db,turb:sw.turb},
     plot_columns:[v('plot-col1')||'altitude_msl_ft', v('plot-col2')||'speed_kmh'],
-
   };
 }
 
@@ -825,6 +2140,7 @@ function _launch(){
   if(running)return;
   running=true;
   document.getElementById('btn-launch').disabled=true;
+  document.getElementById('btn-stop').disabled=false;
   document.getElementById('statusbar').textContent='simulation running...';
   logClear();
   logLine('<span class="nw">[ launch_sim ]  submitting config...</span>');
@@ -842,12 +2158,18 @@ function _launch(){
     .catch(e=>{logLine('<span class="rd">fetch error: '+e+'</span>');resetLaunch();});
 }
 
+function doStop(){
+  document.getElementById('btn-stop').disabled=true;
+  logLine('<span class="yl">[ launch_sim ]  stop requested...</span>');
+  fetch('/stop',{method:'POST'}).catch(function(){});
+}
+
 function pollLog(offset){
   fetch('/log?offset='+offset)
     .then(r=>r.json())
     .then(d=>{
       (d.lines||[]).forEach(l=>{
-        var cls=l.includes('PASS')||l.includes('done')?'ga':l.includes('CAUT')||l.includes('warn')?'yl':l.includes('FAIL')||l.includes('error')?'rd':'nw';
+        var cls=/\[.*PASS.*\]/.test(l)?'ga':/\[.*CAUT.*\]/.test(l)?'yl':/\[.*FAIL.*\]/.test(l)?'rd':'nw';
         logLine('<span class="'+cls+'">'+l.replace(/</g,'&lt;')+'</span>');
         if(l.includes('SQLite DB:')){
           var el=document.getElementById('db-status');
@@ -867,7 +2189,11 @@ function pollLog(offset){
     .catch(()=>setTimeout(()=>pollLog(offset),1500));
 }
 
-function resetLaunch(){running=false;document.getElementById('btn-launch').disabled=false;}
+function resetLaunch(){
+  running=false;
+  document.getElementById('btn-launch').disabled=false;
+  document.getElementById('btn-stop').disabled=true;
+}
 
 function fmtMinSec(totalSeconds){
   var s=Math.round(totalSeconds), mm=Math.floor(s/60), ss=s%60;
@@ -932,64 +2258,90 @@ sync();
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-#  Sim pipeline
+#  Sim pipeline wrapper — bridges the HTTP server to run_pipeline()
 # ═════════════════════════════════════════════════════════════════════════════
 
-_sim_log:  list[str] = []
-_sim_done: bool      = False
-_sim_rc:   int       = -1
-_sim_lock  = threading.Lock()
+_sim_log:     list[str] = []
+_sim_done:    bool      = False
+_sim_rc:      int       = -1
+_sim_running: bool      = False
+_sim_lock     = threading.Lock()
 
 _last_out_dir: Path | None = None
-_last_plots:   dict[str, str] = {}   # {column: filename}, relative to _last_out_dir
-_last_metrics: dict = {}             # flight_time_s / distance_km / energy_mj / arrival_soc_pct
+_last_plots:   dict[str, str] = {}
+_last_metrics: dict = {}
+
+
+def _is_running() -> bool:
+    with _sim_lock:
+        return _sim_running
+
 
 def _run_sim(cfg: dict) -> None:
-    global _sim_done, _sim_rc
+    global _sim_done, _sim_rc, _sim_running
 
-    def _log(msg: str) -> None:
-        with _sim_lock:
-            _sim_log.append(msg)
-        print(msg)
+    with _sim_lock:
+        _sim_running = True
 
-    dep_metar = cfg.get("dep_metar", "").strip()
-    arr_metar = cfg.get("arr_metar", "").strip()
-    cru       = cfg.get("cruise", {})
-    sim       = cfg.get("sim",    {})
-    plot_cols = [c.strip() for c in (cfg.get("plot_columns") or []) if c and c.strip()]
-    if not plot_cols:
-        plot_cols = list(DEFAULT_PLOT_COLUMNS)
-    out_dir   = (ROOT / f"results_{datetime.now(UTC).strftime('%Y%m%d_%H%M%S')}").resolve()
+    def install_sink():
+        global _LOG_SINK
+        with _LOG_LOCK:
+            _LOG_SINK = _sim_log
 
-    ovrs = read_rotor_csv()
+    def clear_sink():
+        global _LOG_SINK
+        with _LOG_LOCK:
+            _LOG_SINK = None
 
+    install_sink()
     try:
-        out_dir.mkdir(parents=True, exist_ok=True)
+        dep_metar = cfg.get("dep_metar", "").strip()
+        arr_metar = cfg.get("arr_metar", "").strip()
+        cru       = cfg.get("cruise", {})
+        sim       = cfg.get("sim",    {})
+        plot_cols = [c.strip() for c in (cfg.get("plot_columns") or []) if c and c.strip()]
+        if not plot_cols:
+            plot_cols = list(DEFAULT_PLOT_COLUMNS)
+        out_dir   = (ROOT / f"results_{datetime.datetime.now(UTC).strftime('%Y%m%d_%H%M%S')}").resolve()
 
-        argv = _build_argv(sim, out_dir, dep_metar, arr_metar, cru)
-        _log(f"[INFO]  DEP: {dep_metar[:70]}")
-        _log(f"[INFO]  ARR: {arr_metar[:70]}")
-        if sim.get("turb"):
-            wind_ms = _metar_wind_speed_ms(dep_metar)
-            _log(f"[INFO]  Dryden turbulence: dep wind {wind_ms:.1f} m/s -> "
-                 f"intensity {round(0.1 * wind_ms, 3)} m/s")
-        _log(f"[INFO]  Invoking: {' '.join(argv[:5])}...\n")
+        rotor_rows, rotor_source = _effective_rotor_rows()
+        if rotor_source == "session":
+            info(f"Rotor fleet: using session override ({len(rotor_rows)} rotors, "
+                 f"rotor_config.csv unchanged)")
 
-        proc = subprocess.Popen(argv, cwd=str(ROOT),
-                                stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                                text=True, bufsize=1)
-        for line in proc.stdout:
-            _log(line.rstrip())
-        proc.wait()
-        sim_rc = proc.returncode
+        speed_factor = sim.get("speed_factor")
+        speed = None
+        if sim.get("mode", "auto") == "auto" and speed_factor is not None and not sim.get("gui"):
+            speed = float(speed_factor) if float(speed_factor) != 1 else None
 
-        # Patch rotor overrides into the card test_flight.py just generated
-        card_path = PLANNING / "test_card.json"
-        if ovrs and card_path.exists():
-            _log(f"[INFO]  Patching test_card.json with {len(ovrs)} rotor override(s)")
-            _patch_test_card(card_path, ovrs)
+        spec = RunSpec(
+            mode=sim.get("mode", "auto"),
+            speed=speed,
+            gui=bool(sim.get("gui")),
+            terrain=bool(sim.get("terrain")),
+            no_build=bool(sim.get("no_build")),
+            no_plan=bool(sim.get("no_plan")),
+            db=bool(sim.get("db")),
+            out_dir=out_dir,
+            csv=None,
+            dep_metar=dep_metar or None,
+            arr_metar=arr_metar or None,
+            speed_kmh=cru.get("speed_kmh"),
+            altitude_ft=cru.get("altitude_ft"),
+            hover_alt_m=cru.get("hover_alt_m"),
+            back_trans_speed_ms=cru.get("back_trans_speed_ms"),
+            nacelle_tilt_deg=cru.get("nacelle_tilt_deg"),
+            auto_turb=bool(sim.get("turb")),
+            interactive=False,           # no TTY in a daemon thread — never block on input()
+            rotor_rows=rotor_rows,        # session override, or a CSV read we already did
+        )
 
-        _log(f"\n[{'PASS' if sim_rc == 0 else 'FAIL'}]  test_flight.py exited rc={sim_rc}")
+        try:
+            out_dir.mkdir(parents=True, exist_ok=True)
+            sim_rc = run_pipeline(spec)
+        except Exception as e:
+            fail(str(e))
+            sim_rc = 3
 
         plots, metrics = {}, {}
         if sim_rc <= 1:
@@ -997,18 +2349,17 @@ def _run_sim(cfg: dict) -> None:
             if csvs:
                 plots, metrics = _process_results_csv(csvs[-1], out_dir, plot_cols)
                 if plots:
-                    _log(f"[INFO]  Saved plot(s): {', '.join(plots.values())}")
+                    info(f"Saved plot(s): {', '.join(plots.values())}")
             else:
-                _log("[CAUT]  no dash_results_*.csv found — skipping plots")
+                warn("no dash_results_*.csv found — skipping plots")
 
-    except Exception as e:
-        _log(f"[FAIL]  {e}")
-        sim_rc = 3
-        plots, metrics = {}, {}
+    finally:
+        clear_sink()
 
     global _last_out_dir, _last_plots, _last_metrics
     with _sim_lock:
         _sim_done = True; _sim_rc = sim_rc
+        _sim_running = False
         _last_out_dir = out_dir
         _last_plots   = plots
         _last_metrics = metrics
@@ -1025,6 +2376,9 @@ class _Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def _send_json(self, code, obj) -> None:
+        self._send(code, "application/json", json.dumps(obj).encode())
+
     def do_GET(self):
         path = urlparse(self.path).path
 
@@ -1032,19 +2386,21 @@ class _Handler(BaseHTTPRequestHandler):
             self._send(200, "text/html; charset=utf-8", _HTML.encode())
 
         elif path == "/rotors":
-            rows = read_rotor_csv()
+            rows, source = _effective_rotor_rows()
             n = len(rows)
             error = None
             if n > 0 and not (2 <= n <= 8):
                 error = f"Invalid rotor count: {n}. Fleet must have 2–8 rotors."
-            payload = json.dumps({"rotors": rows, "path": str(ROTOR_CSV), "error": error}).encode()
-            self._send(200, "application/json", payload)
+            self._send_json(200, {
+                "rotors": rows, "path": str(ROTOR_CSV), "error": error,
+                "baseline": _S4_DEFAULTS, "powerplants": POWERPLANTS,
+                "source": source, "locked": _is_running(),
+            })
 
         elif path == "/card":
             card_path = PLANNING / "test_card.json"
             if card_path.exists():
-                payload = card_path.read_bytes()
-                self._send(200, "application/json", payload)
+                self._send(200, "application/json", card_path.read_bytes())
             else:
                 self._send(404, "application/json", b"{}")
 
@@ -1056,23 +2412,21 @@ class _Handler(BaseHTTPRequestHandler):
                 lines = _sim_log[offset:]
                 done  = _sim_done
                 rc    = _sim_rc
-            payload = json.dumps({
+            self._send_json(200, {
                 "lines": lines, "next_offset": offset + len(lines),
                 "done": done, "exit_code": rc,
-            }).encode()
-            self._send(200, "application/json", payload)
+            })
 
         elif path == "/plots":
             with _sim_lock:
                 out_dir = _last_out_dir
                 plots   = dict(_last_plots)
                 metrics = dict(_last_metrics)
-            payload = json.dumps({
+            self._send_json(200, {
                 "out_dir": str(out_dir) if out_dir else None,
                 "plots": [{"col": c, "url": f"/plot/{f}"} for c, f in plots.items()],
                 "metrics": metrics,
-            }).encode()
-            self._send(200, "application/json", payload)
+            })
 
         elif path.startswith("/plot/"):
             fname = path[len("/plot/"):]
@@ -1089,14 +2443,15 @@ class _Handler(BaseHTTPRequestHandler):
             self._send(404, "text/plain", b"not found")
 
     def do_POST(self):
-        if urlparse(self.path).path == "/launch":
+        path = urlparse(self.path).path
+
+        if path == "/launch":
             length = int(self.headers.get("Content-Length", 0))
             body   = self.rfile.read(length)
             try:
                 cfg = json.loads(body)
             except json.JSONDecodeError as e:
-                self._send(400, "application/json",
-                           json.dumps({"status":"error","message":str(e)}).encode())
+                self._send_json(400, {"status": "error", "message": str(e)})
                 return
 
             global _sim_log, _sim_done, _sim_rc
@@ -1106,8 +2461,65 @@ class _Handler(BaseHTTPRequestHandler):
                 _sim_rc   = -1
 
             threading.Thread(target=_run_sim, args=(cfg,), daemon=True).start()
-            self._send(200, "application/json",
-                       json.dumps({"status":"started"}).encode())
+            self._send_json(200, {"status": "started"})
+
+        elif path == "/stop":
+            signalled = request_stop()
+            self._send_json(200, {"status": "stopping" if signalled else "not_running"})
+
+        elif path == "/rotors":
+            length = int(self.headers.get("Content-Length", 0))
+            body   = self.rfile.read(length)
+            try:
+                payload = json.loads(body)
+            except json.JSONDecodeError as e:
+                self._send_json(400, {"code": 10, "errors": [{"message": str(e)}]})
+                return
+
+            global _rotor_session_rows
+
+            if payload.get("reset"):
+                with _rotor_session_lock:
+                    _rotor_session_rows = None
+                rows = _read_rotor_rows_from_csv()
+                self._send_json(200, {"rotors": rows, "source": "csv",
+                                       "message": "reverted to rotor_config.csv"})
+                return
+
+            if _is_running():
+                self._send_json(409, {"code": 9, "message": "a run is in progress"})
+                return
+
+            rows_in = payload.get("rotors", [])
+            ok, normalized, errors, warnings = _validate_rotor_rows(rows_in)
+            if not ok:
+                self._send_json(400, {"code": 10, "errors": errors})
+                return
+
+            with _rotor_session_lock:
+                _rotor_session_rows = normalized
+
+            # Patch the *current* test_card.json immediately, if one exists,
+            # so the Launch preview and any --no-plan run reflect the edit
+            # right away. This never touches rotor_config.csv — the CSV on
+            # disk is untouched by design; only this run (and any run before
+            # a Reset / server restart) sees the override.
+            card_path = PLANNING / "test_card.json"
+            card_patched = False
+            if card_path.exists():
+                try:
+                    card = json.loads(card_path.read_text())
+                    card["rotor_fleet"] = _rotor_fleet_overrides(normalized)
+                    card_path.write_text(json.dumps(card, indent=2))
+                    card_patched = True
+                except Exception as e:
+                    warn(f"could not patch test_card.json with rotor override: {e}")
+
+            self._send_json(200, {
+                "rotors": normalized, "source": "session",
+                "card_patched": card_patched, "warnings": warnings,
+            })
+
         else:
             self._send(404, "text/plain", b"not found")
 
@@ -1117,17 +2529,20 @@ def main() -> int:
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--port",            type=int, default=5780)
     p.add_argument("--no-browser",      action="store_true")
-    p.add_argument("--preview-command", action="store_true",
-                   help="GUI opens normally; Launch prints command only, nothing runs")
+    _add_pipeline_args(p)
     args = p.parse_args()
 
+    # Headless pipeline run: `python3 windblade.py --auto ...` / `--manual ...`.
+    # --auto/--manual are optional here — omitting both just opens the GUI.
+    if args.auto or args.manual:
+        spec = spec_from_args(args)
+        return run_pipeline(spec)
+
     url = f"http://localhost:{args.port}"
-    _hdr("eVTOL  ·  Mission Planner")
+    header("eVTOL  ·  Mission Planner")
     info(f"Serving GUI at  {GA}{url}{NC}")
     info(f"Repo root:      {ROOT}")
     info(f"Rotor CSV:      {ROTOR_CSV}")
-    if args.preview_command:
-        caution("--preview-command mode active")
     info(f"Press  {YL}Ctrl+C{NC}  to stop\n")
 
     server = HTTPServer(("localhost", args.port), _Handler)
@@ -1138,7 +2553,7 @@ def main() -> int:
         server.serve_forever()
     except KeyboardInterrupt:
         print()
-        caution("Shutting down")
+        warn("Shutting down")
     return 0
 
 if __name__ == "__main__":
