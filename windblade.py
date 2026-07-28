@@ -124,20 +124,20 @@ def plain(msg):   _emit(msg)   # for output that has no PASS/CAUT/FAIL severity
 # ══════════════════════════════════════════════════════════════════════════════
 #  Rotor fleet — one shared parser, one shared baseline. Every reader of
 #  rotor_config.csv (the GUI table, the test-card generator, the SQLite
-#  export) goes through _read_rotor_rows_from_csv() and _S4_DEFAULTS below,
+#  export) goes through _read_rotor_rows_from_csv() and _ROTOR_BASELINE below,
 #  so the "differs from baseline" highlighting and the override-suppression
 #  logic always agree on what "default" means.
 # ══════════════════════════════════════════════════════════════════════════════
 
-# S4-class baseline. Rows that match these exactly are not emitted as
+# Baseline rotor spec. Rows that match these exactly are not emitted as
 # test_card.json overrides (keeps the card clean for the all-default case),
 # and are what the GUI table diffs against to highlight non-default cells.
-_S4_DEFAULTS = {
+_ROTOR_BASELINE = {
     "R_m": 1.45, "n_blades": 5, "chord_m": 0.096,
     "twist_root_deg": 16.0, "twist_tip_deg": 6.0,
     "pitch_offset_deg": 4.4, "P_max_kW": 236.0, "rpm_hover": 1284.0,
 }
-_S4_POWERPLANT = "electric"
+_ROTOR_BASELINE_POWERPLANT = "electric"
 POWERPLANTS    = ["electric", "turbine_electric", "turboshaft"]
 
 _TRUE_STRS  = {"true", "t", "yes", "y", "1"}
@@ -197,7 +197,7 @@ def _read_rotor_rows_from_csv() -> list[dict]:
 
 def _rotor_fleet_overrides(rows: list[dict] | None = None) -> dict:
     """Build the rotor_fleet block for test_card.json: a per-rotor override
-    entry for any rotor whose geometry/powerplant/mode differs from the S4
+    entry for any rotor whose geometry/powerplant/mode differs from the
     baseline. Rows that are all-default produce no entry.
 
     rows=None reads the CSV directly — this is the CLI/headless path (no
@@ -211,16 +211,16 @@ def _rotor_fleet_overrides(rows: list[dict] | None = None) -> dict:
     for r in rows:
         entry = {"rotor_id": r["rotor_id"]}
         changed = False
-        for field_name, default in _S4_DEFAULTS.items():
+        for field_name, default in _ROTOR_BASELINE.items():
             val = r[field_name]
             if isinstance(default, int):
                 val = int(round(val))
             if abs(val - default) > 1e-9:
                 changed = True
             entry[field_name] = val
-        powerplant = r.get("powerplant") or _S4_POWERPLANT
+        powerplant = r.get("powerplant") or _ROTOR_BASELINE_POWERPLANT
         entry["powerplant"] = powerplant
-        if powerplant != _S4_POWERPLANT:
+        if powerplant != _ROTOR_BASELINE_POWERPLANT:
             changed = True
         lift, thrust = bool(r.get("lift", True)), bool(r.get("thrust", True))
         entry["lift"], entry["thrust"] = lift, thrust
@@ -377,6 +377,17 @@ def _metar_wind_speed_ms(metar: str) -> float:
 
 # Wind group in a METAR: dddss[Ggmax]KT|MPS|KMH  (ddd or VRB, ss = sustained speed)
 _METAR_WIND_RE = re.compile(r'\b(?:\d{3}|VRB)(\d{2,3})(?:G\d{2,3})?(KT|MPS|KMH)\b')
+
+# fly.jl runs a terrain-module self-test on every launch (fixed routes like
+# KAXX-KSAF, KDEN-KCOS, checking predefined profiles against known deltas) —
+# it's not about the mission being flown, so it's filtered out of both the
+# console and the browser log rather than streamed through plain().
+_TERRAIN_SELFTEST_INFO_RE = re.compile(r'^\[\s*Info:\s*Terrain:', re.IGNORECASE)
+_TERRAIN_SELFTEST_CHECK_RE = re.compile(r'^\s*\[(?:PASS|FAIL)\]\s.*\bgot=.*\bexpected=', re.IGNORECASE)
+
+def _is_terrain_selftest_line(line: str) -> bool:
+    return bool(_TERRAIN_SELFTEST_INFO_RE.match(line)
+                or _TERRAIN_SELFTEST_CHECK_RE.match(line))
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -919,6 +930,8 @@ def run_simulation(gui: bool, manual: bool,
     _set_active_proc(proc)
     try:
         for line in proc.stdout:
+            if _is_terrain_selftest_line(line):
+                continue
             plain(line.rstrip())
         ret = proc.wait()
     finally:
@@ -2393,7 +2406,7 @@ class _Handler(BaseHTTPRequestHandler):
                 error = f"Invalid rotor count: {n}. Fleet must have 2–8 rotors."
             self._send_json(200, {
                 "rotors": rows, "path": str(ROTOR_CSV), "error": error,
-                "baseline": _S4_DEFAULTS, "powerplants": POWERPLANTS,
+                "baseline": _ROTOR_BASELINE, "powerplants": POWERPLANTS,
                 "source": source, "locked": _is_running(),
             })
 
@@ -2539,7 +2552,7 @@ def main() -> int:
         return run_pipeline(spec)
 
     url = f"http://localhost:{args.port}"
-    header("eVTOL  ·  Mission Planner")
+    header("Mission Planner")
     info(f"Serving GUI at  {GA}{url}{NC}")
     info(f"Repo root:      {ROOT}")
     info(f"Rotor CSV:      {ROTOR_CSV}")
