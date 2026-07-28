@@ -45,7 +45,6 @@ windblade/
 │       ├── rotor_config.csv
 │       ├── rotor_mixer.jl
 │       └── rotor_system.jl
-├── test_flight.py
 ├── windblade.py
 └── world
     ├── atmosphere.jl
