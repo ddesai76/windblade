@@ -1,25 +1,447 @@
-icao,lat_deg,lon_deg,elev_m,name
-KAXX,36.422,-105.289905,2554,Angel Fire Airport
-KSAF,35.617222,-106.089444,1935,Santa Fe Regional Airport
-KDEN,39.861667,-104.673056,1655.5,Denver International Airport
-KCOS,38.805833,-104.700556,1881,Colorado Springs Airport
-KABQ,35.040194,-106.609194,1619.1,Albuquerque International Sunport
-KLAX,33.942536,-118.408075,38.1,Los Angeles International Airport
-KSFO,37.618972,-122.374889,4,San Francisco International Airport
-KSNA,33.675667,-117.868222,17.1,John Wayne Airport Orange County
-KSJC,37.362375,-121.929022,18,San Jose International Airport
-KSLC,40.788389,-111.977772,1288.1,Salt Lake City International Airport
-KPHX,33.437269,-112.007788,340.5,Phoenix Sky Harbor International Airport
-KSAT,29.533694,-98.469778,242.9,San Antonio International Airport
-KDAL,32.847111,-96.851778,145.4,Dallas Love Field
-KDFW,32.896944,-97.038056,182.3,Dallas Fort Worth International Airport
-KMCO,28.429394,-81.308994,29,Orlando International Airport
-KMIA,25.79565,-80.290556,2.7,Miami International Airport
-KATL,33.636719,-84.428067,313.3,Hartsfield-Jackson Atlanta International
-KJFK,40.639751,-73.778925,3.9,New York John F. Kennedy International
-KLGA,40.777245,-73.872608,6.7,New York LaGuardia Airport
-KEWR,40.692501,-74.168701,9.1,Newark Liberty International Airport
-KBOS,42.364347,-71.005181,9.1,Boston Logan International Airport
-KORD,41.978603,-87.904842,205.1,Chicago O'Hare International Airport
-KMDW,41.786001,-87.752417,188.1,Chicago Midway International Airport
-KSEA,47.449888,-122.311777,131.7,Seattle-Tacoma International Airport
+icao	lat_deg	lon_deg	elev_m	name
+K1RL	48.977316	-123.079294	3	Point Roberts Airpark
+K74S	48.498513	-122.662513	73.5	Anacortes Airport
+KABE	40.651773	-75.442797	119.8	Lehigh Valley International Airport
+KABI	32.411301	-99.6819	545.9	Abilene Regional Airport
+KABQ	35.040194	-106.609194	1619.1	Albuquerque International Sunport
+KABR	45.4491	-98.421799	396.8	Aberdeen Regional Airport
+KABY	31.532946	-84.196215	60	Southwest Georgia Regional Airport
+KACK	41.253101	-70.060204	14.3	Nantucket Memorial Airport
+KACT	31.6113	-97.230499	157.3	Waco Regional Airport
+KACV	40.978101	-124.109	67.4	California Redwood Coast-Humboldt County Airport
+KACY	39.456201	-74.577511	22.9	Atlantic City International Airport
+KAEX	31.325828	-92.546702	27.1	Alexandria International Airport
+KAGS	33.3699	-81.9645	43.9	Augusta Regional At Bush Field
+KAIA	42.052543	-102.803965	1198.2	Alliance Municipal Airport
+KALB	42.748299	-73.801697	86.9	Albany International Airport
+KALO	42.557098	-92.400299	266.1	Waterloo Regional Airport
+KALS	37.434898	-105.866997	2297.9	San Luis Valley Regional Airport/Bergman Field
+KALW	46.094898	-118.288002	363.9	Walla Walla Regional Airport
+KAMA	35.217857	-101.706444	1099.4	Rick Husband Amarillo International Airport
+KAOO	40.296398	-78.32	458.1	Altoona Blair County Airport
+KAPN	45.078098	-83.560303	210.3	Alpena County Regional Airport
+KART	43.991901	-76.021698	99.1	Watertown International Airport
+KASE	39.223202	-106.869003	2383.5	Aspen-Pitkin County Airport (Sardy Field)
+KATL	33.636719	-84.428067	313.3	Hartsfield-Jackson Atlanta International
+KATW	44.258515	-88.519	279.8	Appleton International Airport
+KATY	44.914001	-97.154701	533.1	Watertown Regional Airport
+KAUG	44.320599	-69.797302	107.3	Augusta State Airport
+KAUS	30.197535	-97.662015	165.2	Austin Bergstrom International Airport
+KAVL	35.435488	-82.541853	659.9	Asheville Regional Airport
+KAVP	41.337064	-75.724232	293.2	Wilkes-Barre/Scranton International Airport
+KAWO	48.161448	-122.158442	43.3	Arlington Municipal Airport
+KAXX	36.422	-105.289905	2554	Angel Fire Airport
+KAZO	42.232105	-85.549637	266.4	Kalamazoo/Battle Creek International Airport
+KBBG	36.532082	-93.200544	396.8	Branson Airport
+KBDL	41.938555	-72.688016	52.7	Bradley International Airport
+KBED	42.470001	-71.289001	40.5	Laurence G Hanscom Field
+KBFD	41.803101	-78.640099	653.2	Bradford Regional Airport
+KBFF	41.874001	-103.596001	1209.1	Western Neb. Rgnl/William B. Heilig Airport
+KBFI	47.527042	-122.29995	6.4	King County International Airport - Boeing Field
+KBFL	35.433601	-119.056999	155.4	Meadows Field
+KBGM	42.208698	-75.979797	498.7	Greater Binghamton/Edwin A Link field
+KBGR	44.806364	-68.826668	58.5	Bangor International Airport
+KBHB	44.450001	-68.361504	25.3	Hancock County-Bar Harbor Airport
+KBHM	33.562877	-86.750712	198.1	Birmingham-Shuttlesworth International Airport
+KBID	41.168446	-71.578631	32.9	Block Island State Airport
+KBIH	37.3731	-118.363998	1257	Eastern Sierra Regional Airport
+KBIL	45.808932	-108.541242	1113.1	Billings Logan International Airport
+KBIS	46.772734	-100.746874	506.3	Bismarck Municipal Airport
+KBJC	39.908798	-105.116997	1729.1	Rocky Mountain Metropolitan Airport
+KBKW	37.7873	-81.124199	763.2	Raleigh County Memorial Airport
+KBLI	48.792801	-122.538002	51.8	Bellingham International Airport
+KBLV	38.5452	-89.835197	139.9	Scott AFB/Midamerica Airport
+KBMI	40.4771	-88.915901	265.5	Central Illinois Regional Airport at Bloomington-Normal
+KBNA	36.1245	-86.6782	182.6	Nashville International Airport
+KBOI	43.5644	-116.223	875.1	Boise Air Terminal/Gowen Field
+KBOS	42.364347	-71.005181	9.1	Boston Logan International Airport
+KBPT	29.9508	-94.020699	4.6	Jack Brooks Regional Airport
+KBQK	31.258801	-81.466499	7.9	Brunswick Golden Isles Airport
+KBRD	46.402861	-94.129727	375.5	Brainerd Lakes Regional Airport
+KBRL	40.783199	-91.125504	212.8	Southeast Iowa Regional Airport
+KBRO	25.907238	-97.425235	6.7	Brownsville South Padre Island International Airport
+KBTM	45.9548	-112.497002	1691.6	Bert Mooney Airport
+KBTR	30.533199	-91.149597	21.3	Baton Rouge Metropolitan Airport
+KBTV	44.471901	-73.153297	102.1	Patrick Leahy Burlington International Airport
+KBUF	42.940498	-78.732201	221.9	Buffalo Niagara International Airport
+KBUR	34.202834	-118.35805	237.1	Hollywood Burbank/Bob Hope Airport
+KBVU	35.947161	-114.858799	670.9	Boulder City Municipal Airport
+KBVY	42.584167	-70.916111	33	Beverly Regional Airport
+KBWI	39.1754	-76.668297	44.5	Baltimore/Washington International Thurgood Marshall Airport
+KBZN	45.778853	-111.153711	1363.4	Bozeman Yellowstone International Airport
+KCAE	33.938172	-81.123022	71.9	Columbia Metropolitan Airport
+KCAK	40.9161	-81.4422	374.3	Akron Canton Regional Airport
+KCCR	37.9897	-122.056999	7.9	Buchanan Field
+KCDC	37.701	-113.098999	1713.6	Cedar City Regional Airport
+KCDR	42.837601	-103.095001	1004.9	Chadron Municipal Airport
+KCEC	41.778929	-124.236403	18.6	Jack Mc Namara Field Airport
+KCEZ	37.303001	-108.627998	1803.8	Cortez Municipal Airport
+KCGI	37.2253	-89.570801	104.2	Cape Girardeau Regional Airport
+KCHA	35.035301	-85.203796	208.2	Chattanooga Metropolitan Airport (Lovell Field)
+KCHO	38.138599	-78.452904	194.8	Charlottesville Albemarle Airport
+KCHS	32.896159	-80.038151	14	Charleston International Airport
+KCID	41.884701	-91.7108	264.9	The Eastern Iowa Airport
+KCIU	46.242038	-84.462082	243.8	Chippewa County International Airport
+KCKB	39.2966	-80.228104	370.9	North Central West Virginia Airport
+KCLE	41.411701	-81.8498	241.1	Cleveland Hopkins International Airport
+KCLL	30.5886	-96.3638	97.5	Easterwood Field
+KCLT	35.214001	-80.9431	228	Charlotte Douglas International Airport
+KCMH	39.998001	-82.891899	248.4	John Glenn Columbus International Airport
+KCMI	40.039819	-88.276249	230.1	University of Illinois Willard Airport
+KCMX	47.1684	-88.489098	333.8	Houghton County Memorial Airport
+KCNM	32.337502	-104.263	1004.3	Cavern City Air Terminal
+KCNY	38.755001	-109.754997	1389	Canyonlands Regional Airport
+KCOD	44.520199	-109.024002	1555.1	Yellowstone Regional Airport
+KCOS	38.805833	-104.700556	1881	Colorado Springs Airport
+KCOU	38.8181	-92.219597	271	Columbia Regional Airport
+KCPR	42.907381	-106.461609	1630.7	Casper-Natrona County International Airport
+KCRP	27.770399	-97.501198	13.4	Corpus Christi International Airport
+KCRQ	33.1283	-117.279999	100.9	McClellan-Palomar Airport
+KCRW	38.3731	-81.593201	299	Yeager Airport
+KCSG	32.516415	-84.939602	121	Columbus Airport
+KCVG	39.048801	-84.667801	273.1	Cincinnati Northern Kentucky International Airport
+KCVN	34.426594	-103.078794	1285	Clovis Municipal Airport
+KCVX	45.304798	-85.274803	203.9	Charlevoix Municipal Airport
+KCWA	44.777448	-89.670238	389.2	Central Wisconsin Airport
+KCYS	41.155701	-104.811997	1877.3	Cheyenne Regional Jerry Olson Field
+KDAB	29.18255	-81.059464	10.4	Daytona Beach International Airport
+KDAL	32.847111	-96.851778	145.4	Dallas Love Field
+KDAY	39.902401	-84.219398	307.5	James M. Cox Dayton International Airport
+KDBQ	42.402	-90.709503	328.3	Dubuque Regional Airport
+KDCA	38.8521	-77.037697	4.6	Ronald Reagan Washington National Airport
+KDDC	37.763401	-99.965599	790.7	Dodge City Regional Airport
+KDEC	39.834599	-88.8657	207.9	Decatur Airport
+KDEN	39.861667	-104.673056	1655.5	Denver International Airport
+KDFW	32.896944	-97.038056	182.3	Dallas Fort Worth International Airport
+KDHN	31.321301	-85.4496	122.2	Dothan Regional Airport
+KDIK	46.797533	-102.801905	790	Dickinson Theodore Roosevelt Regional Airport
+KDJT	26.683201	-80.095596	5.8	President Donald J. Trump International Airport
+KDLH	46.841873	-92.198746	435.3	Duluth International Airport
+KDOV	39.129501	-75.466003	7.3	Dover Civil Air Terminal/Dover Air Force Base
+KDRO	37.151501	-107.753998	2037.6	Durango La Plata County Airport
+KDSM	41.534027	-93.656719	292	Des Moines International Airport
+KDTS	30.400101	-86.471497	7	Destin Executive Airport
+KDTW	42.21377	-83.353786	196.6	Detroit Metropolitan Wayne County Airport
+KDUJ	41.178299	-78.898697	553.8	DuBois Regional Airport
+KDVL	48.115454	-98.908796	443.8	Devils Lake Regional Airport
+KEAR	40.727001	-99.006798	649.5	Kearney Regional Airport
+KEAT	47.398899	-120.207001	380.7	Pangborn Memorial Airport
+KEAU	44.865799	-91.484299	278.3	Chippewa Valley Regional Airport
+KECP	30.357106	-85.795414	21	Northwest Florida Beaches International Airport
+KEDC	30.398049	-97.566909	189	Austin Executive Airport
+KEGE	39.642601	-106.917999	1995.8	Eagle County Regional Airport
+KEKO	40.824902	-115.792	1566.7	Elko Regional Airport
+KELD	33.221001	-92.813301	84.4	South Arkansas Regional Airport at Goodwin Field
+KELM	42.159901	-76.891602	290.8	Elmira Corning Regional Airport
+KELP	31.809908	-106.375607	1206.7	El Paso International Airport
+KERI	42.083127	-80.173867	223.1	Erie International Tom Ridge Field
+KESC	45.723199	-87.088623	185.6	Delta County Airport
+KEUG	44.124599	-123.211998	114	Eugene Airport
+KEVV	38.036999	-87.532402	127.4	Evansville Regional Airport
+KEWB	41.676102	-70.956902	24.4	New Bedford Regional Airport
+KEWN	35.073002	-77.0429	5.5	Coastal Carolina Regional Airport
+KEWR	40.692501	-74.168701	9.1	Newark Liberty International Airport
+KEYW	24.556119	-81.759579	0.9	Key West International Airport
+KFAR	46.9207	-96.815804	274.9	Hector International Airport
+KFAT	36.775767	-119.718018	102.4	Fresno Yosemite International Airport
+KFAY	34.991199	-78.880302	57.6	Fayetteville Regional Airport - Grannis Field
+KFHR	48.523654	-123.024645	34.4	Friday Harbor Airport
+KFLG	35.139757	-111.669826	2137.9	Flagstaff Pulliam Airport
+KFLL	26.072599	-80.152702	2.7	Fort Lauderdale Hollywood International Airport
+KFLO	34.185398	-79.7239	44.5	Florence Regional Airport
+KFNT	42.969294	-83.743355	238.4	Bishop International Airport
+KFOD	42.552624	-94.191237	352.3	Fort Dodge Regional Airport
+KFSD	43.585463	-96.741152	435.6	Sioux Falls Regional Airport
+KFSM	35.336601	-94.367401	143	Fort Smith Regional Airport
+KFTW	32.819919	-97.360818	216.4	Fort Worth Meacham International Airport
+KFWA	40.978896	-85.194465	248.1	Fort Wayne International Airport
+KGCC	44.3489	-105.539001	1330.5	Northeast Wyoming Regional Airport
+KGCK	37.927502	-100.723999	881.2	Garden City Regional Airport
+KGCN	35.9524	-112.147003	2014.4	Grand Canyon National Park Airport
+KGDV	47.137658	-104.80691	749.2	Dawson Community Airport
+KGEG	47.6199	-117.533997	724.2	Spokane International Airport
+KGFK	47.949299	-97.176102	257.6	Grand Forks International Airport
+KGGG	32.383999	-94.711502	111.3	East Texas Regional Airport
+KGGW	48.212502	-106.614998	699.8	Glasgow Valley County Airport Wokal Field
+KGJT	39.126663	-108.529387	1480.7	Grand Junction Regional Airport
+KGLH	33.482899	-90.985603	39.9	Mid Delta Regional Airport
+KGNV	29.6901	-82.271797	46.3	Gainesville Regional Airport
+KGPI	48.310501	-114.255997	907.4	Glacier Park International Airport
+KGPT	30.405582	-89.069836	8.5	Gulfport Biloxi International Airport
+KGRB	44.483459	-88.130805	211.8	Austin Straubel International Airport
+KGRI	40.967499	-98.309601	563	Central Nebraska Regional Airport
+KGRK	31.0672	-97.828903	309.4	Killeen Regional Airport / Robert Gray Army Airfield
+KGRR	42.880798	-85.522797	242	Gerald R. Ford International Airport
+KGSO	36.09937	-79.937262	281.9	Piedmont Triad International Airport
+KGSP	34.895699	-82.218903	293.8	Greenville-Spartanburg International Airport
+KGTF	47.481998	-111.371002	1121.7	Great Falls International Airport
+KGTR	33.450298	-88.5914	80.5	Golden Triangle Regional Airport
+KGUC	38.534672	-106.934566	2340.9	Gunnison Crested Butte Regional Airport
+KGUP	35.511653	-108.788166	1972.7	Gallup Municipal Airport
+KGYY	41.617087	-87.413206	180.1	Gary/Chicago International Airport
+KHDN	40.481201	-107.218002	2013.5	Yampa Valley Airport
+KHGR	39.708771	-77.728014	214.3	Hagerstown Regional Richard A Henson Field
+KHHR	33.922798	-118.334999	20.1	Jack Northrop Field Hawthorne Municipal Airport
+KHIB	47.384831	-92.836905	412.7	Range Regional Airport
+KHII	34.570506	-114.357745	238.7	Lake Havasu City Airport
+KHLN	46.6068	-111.983002	1181.7	Helena Regional Airport
+KHOB	32.6875	-103.217003	1115.9	Lea County Regional Airport
+KHOT	34.4788	-93.096262	164.6	Memorial Field Airport
+KHOU	29.645336	-95.276812	14	William P. Hobby Airport
+KHPN	41.067001	-73.707603	133.8	Westchester County Airport
+KHRL	26.2285	-97.654404	11	Valley International Airport
+KHRO	36.261501	-93.154701	416.1	Boone County Airport
+KHSV	34.636244	-86.774378	191.7	Huntsville International Airport
+KHTS	38.366699	-82.557999	252.4	Tri-State Airport / Milton J. Ferguson Field
+KHVN	41.262869	-72.887694	3.7	Tweed New Haven Airport
+KHVR	48.541387	-109.762859	789.7	Havre City County Airport
+KHXD	32.2244	-80.697502	5.8	Hilton Head Airport
+KHYA	41.6693	-70.280403	16.5	Cape Cod Gateway Airport
+KHYS	38.844521	-99.273148	609.3	Hays Regional Airport
+KIAD	38.9445	-77.455803	95.1	Washington Dulles International Airport
+KIAG	43.1073	-78.946198	179.5	Niagara Falls International Airport
+KIAH	29.9844	-95.3414	29.6	George Bush Intercontinental Airport
+KICT	37.650314	-97.428583	406.3	Wichita Dwight D. Eisenhower National Airport
+KIDA	43.514599	-112.070999	1446	Idaho Falls Regional Airport
+KILG	39.678699	-75.606499	24.4	Wilmington Airport
+KILM	34.272345	-77.905117	9.8	Wilmington International Airport
+KIMT	45.81911	-88.114557	360.3	Ford Airport
+KIND	39.7173	-86.294403	242.9	Indianapolis International Airport
+KINL	48.5662	-93.403099	361.2	Falls International Airport
+KIPL	32.83539	-115.574026	-16.5	Imperial County Airport
+KIPT	41.242126	-76.92245	161.2	Williamsport Regional Airport
+KIRK	40.093498	-92.544899	294.4	Kirksville Regional Airport
+KISP	40.796324	-73.101703	30.2	Long Island MacArthur Airport
+KITH	42.491001	-76.458397	335	Ithaca Tompkins Regional Airport
+KIWA	33.3078	-111.654999	421.2	Mesa Gateway Airport
+KIWD	46.525298	-90.131578	374.9	Gogebic Iron County Airport
+KJAC	43.6073	-110.737999	1966.3	Jackson Hole Airport
+KJAN	32.311199	-90.075897	105.5	Jackson-Medgar Wiley Evers International Airport
+KJAX	30.492469	-81.687813	9.1	Jacksonville International Airport
+KJBR	35.831699	-90.6464	79.9	Jonesboro Municipal Airport
+KJFK	40.639751	-73.778925	3.9	New York John F. Kennedy International
+KJLN	37.151798	-94.498299	299	Joplin Regional Airport
+KJMS	46.929699	-98.6782	457.2	Jamestown Regional Airport
+KJQF	35.387798	-80.709099	214.9	Concord-Padgett Regional Airport
+KJRA	40.755107	-74.006896	2.1	West 30th Street Heliport
+KJST	40.316101	-78.8339	696.2	John Murtha Johnstown Cambria County Airport
+KLAF	40.412875	-86.939363	184.7	Purdue University Airport
+KLAL	27.989267	-82.020715	43.3	Lakeland Linder International Airport
+KLAN	42.777582	-84.585721	262.4	Capital Region International Airport
+KLAR	41.312099	-105.675003	2220.2	Laramie Regional Airport
+KLAS	36.083361	-115.151817	664.8	Harry Reid International Airport
+KLAW	34.567699	-98.416603	338.3	Lawton Fort Sill Regional Airport
+KLAX	33.942536	-118.408075	38.1	Los Angeles International Airport
+KLBB	33.663601	-101.822998	1000.4	Lubbock Preston Smith International Airport
+KLBE	40.275902	-79.4048	365.5	Arnold Palmer Regional Airport
+KLBF	41.126202	-100.683998	846.4	North Platte Regional Airport Lee Bird Field
+KLBL	37.044201	-100.959999	879.3	Liberal Mid-America Regional Airport
+KLCH	30.126101	-93.223297	4.6	Lake Charles Regional Airport
+KLCK	39.813801	-82.927803	226.8	Rickenbacker International Airport
+KLEB	43.626099	-72.304199	183.8	Lebanon Municipal Airport
+KLEX	38.035066	-84.606738	298.4	Blue Grass Airport
+KLFT	30.205299	-91.987602	12.8	Lafayette Regional Airport
+KLGA	40.777245	-73.872608	6.7	New York LaGuardia Airport
+KLGB	33.816523	-118.149891	18.3	Long Beach International Airport
+KLIT	34.729222	-92.223591	79.9	Bill & Hillary Clinton National Airport/Adams Field
+KLNK	40.844882	-96.76178	371.6	Lincoln Airport
+KLNS	40.1217	-76.296097	122.8	Lancaster Airport
+KLRD	27.5438	-99.461601	154.8	Laredo International Airport
+KLRU	32.289398	-106.921997	1358.2	Las Cruces International Airport
+KLSE	43.879002	-91.256699	199.6	La Crosse Regional Airport
+KLUK	39.102357	-84.418945	147.2	Cincinnati Municipal Airport Lunken Field
+KLWB	37.857914	-80.400438	701.6	Greenbrier Valley Airport
+KLWS	46.3745	-117.014999	439.5	Lewiston Nez Perce County Airport
+KLYH	37.326698	-79.200401	285.9	Lynchburg Regional Airport - Preston Glenn Field
+KMAF	31.942499	-102.202003	875.1	Midland International Air and Space Port
+KMBL	44.272707	-86.246495	189.3	Manistee County Blacker Airport
+KMBS	43.533181	-84.083104	203.6	MBS International Airport
+KMCE	37.284698	-120.514	47.2	Merced Regional Macready Field
+KMCI	39.301699	-94.713893	312.7	Kansas City International Airport
+KMCK	40.207787	-100.592794	787.3	McCook Ben Nelson Regional Airport
+KMCN	32.692799	-83.6492	107.9	Middle Georgia Regional Airport
+KMCO	28.429394	-81.308994	29	Orlando International Airport
+KMCW	43.159801	-93.329716	369.7	Mason City Municipal Airport
+KMDT	40.192838	-76.762333	94.5	Harrisburg International Airport
+KMDW	41.786001	-87.752417	188.1	Chicago Midway International Airport
+KMEI	32.3326	-88.7519	90.5	Key Field / Meridian Regional Airport
+KMEM	35.043845	-89.97634	103.9	Memphis International Airport
+KMFE	26.176141	-98.237965	32.6	McAllen Miller International Airport
+KMFR	42.374199	-122.873001	406.9	Rogue Valley International-Medford Airport
+KMGC	41.7033	-86.821198	199.6	Michigan City Municipal Airport
+KMGM	32.300598	-86.393997	67.4	Montgomery Regional (Dannelly Field) Airport
+KMGW	39.643305	-79.917598	380.4	Morgantown Municipal Airport Walter L. (Bill) Hart Field
+KMHK	39.140999	-96.670799	322.2	Manhattan Regional Airport
+KMHT	42.932598	-71.435699	81.1	Manchester-Boston Regional Airport
+KMIA	25.79565	-80.290556	2.7	Miami International Airport
+KMKE	42.947201	-87.896599	220.4	General Mitchell International Airport
+KMKG	43.169498	-86.238197	191.7	Muskegon County Airport
+KMKL	35.599899	-88.915604	132.3	McKellar-Sipes Regional Airport
+KMLB	28.102009	-80.641088	10.1	Melbourne Orlando International Airport
+KMLI	41.448502	-90.5075	179.8	Quad City International Airport
+KMLU	32.510899	-92.037697	24.1	Monroe Regional Airport
+KMMH	37.625381	-118.84306	2174.7	Mammoth Yosemite Airport
+KMOB	30.6912	-88.242798	66.8	Mobile Regional Airport
+KMOT	48.25801	-101.279123	523	Minot International Airport
+KMRY	36.586777	-121.844183	78.3	Monterey Regional Airport
+KMSL	34.745123	-87.612981	167.9	Northwest Alabama Regional Airport
+KMSN	43.1399	-89.337502	270.4	Dane County Regional Truax Field
+KMSO	46.915816	-114.091107	977.2	Missoula Montana Airport
+KMSP	44.880081	-93.221741	256.3	Minneapolis–Saint Paul International Airport / Wold–Chamberlain Field
+KMSS	44.936157	-74.844304	65.5	Massena International Airport Richards Field
+KMSY	29.993401	-90.264673	1.2	Louis Armstrong New Orleans International Airport
+KMTJ	38.5098	-107.893997	1755.3	Montrose Regional Airport
+KMTP	41.0765	-71.920797	1.8	Montauk Airport
+KMVY	41.393101	-70.614304	20.4	Martha's Vineyard Airport
+KMWA	37.751208	-89.016568	143.9	Veterans Airport of Southern Illinois
+KMWL	32.781601	-98.060204	296.9	Mineral Wells Regional Airport
+KMYL	44.888837	-116.101112	1531.3	McCall Municipal Airport
+KMYR	33.679699	-78.928299	7.6	Myrtle Beach International Airport
+KNYL	32.650938	-114.609375	64.9	Yuma International Airport / Marine Corps Air Station Yuma
+KOAJ	34.829201	-77.612099	28.7	Albert J Ellis Airport
+KOAK	37.720085	-122.221184	2.7	Oakland San Francisco Bay Airport
+KOGD	41.1959	-112.012001	1363.4	Ogden Hinckley Airport
+KOGS	44.6819	-75.4655	90.5	Ogdensburg International Airport
+KOKC	35.393388	-97.598248	394.7	OKC Will Rogers World Airport
+KOLF	48.094501	-105.574997	605.3	L M Clayton Airport
+KOLM	46.969399	-122.903	63.7	Olympia Regional Airport
+KOMA	41.3032	-95.894096	299.9	Eppley Airfield
+KONT	34.056	-117.600998	287.7	Ontario International Airport
+KOPF	25.907	-80.278397	2.4	Miami-Opa Locka Executive Airport
+KORD	41.978603	-87.904842	205.1	Chicago O'Hare International Airport
+KORF	36.895341	-76.201	7.9	Norfolk International Airport
+KORH	42.2673	-71.875702	307.5	Worcester Regional Airport
+KORS	48.708199	-122.910004	9.4	Orcas Island Airport
+KOTH	43.417099	-124.246002	5.2	Southwest Oregon Regional Airport
+KOWB	37.740101	-87.166801	124.1	Owensboro Daviess County Airport
+KOXB	38.310398	-75.124001	3.4	Ocean City Municipal Airport
+KPAE	47.9063	-122.281998	184.7	Seattle Paine Field International Airport
+KPAH	37.060799	-88.773804	125	Barkley Regional Airport
+KPBG	44.650902	-73.468102	71.3	Plattsburgh International Airport
+KPCW	41.515647	-82.868328	179.8	Erie-Ottawa International Airport
+KPDK	33.87633	-84.30213	305.7	DeKalb Peachtree Airport
+KPDT	45.695099	-118.841003	456.3	Eastern Oregon Regional Airport at Pendleton
+KPDX	45.588699	-122.598	9.4	Portland International Airport
+KPGA	36.924234	-111.447716	1315.5	Page Municipal Airport
+KPGD	26.9202	-81.990501	7.9	Punta Gorda Airport
+KPGV	35.635535	-77.384262	7.9	Pitt-Greenville Airport
+KPHF	37.131901	-76.492996	12.8	Newport News Williamsburg International Airport
+KPHL	39.871899	-75.241096	11	Philadelphia International Airport
+KPHX	33.437269	-112.007788	340.5	Phoenix Sky Harbor International Airport
+KPIA	40.663841	-89.692631	201.2	General Wayne A. Downing Peoria International Airport
+KPIB	31.4671	-89.337097	90.8	Hattiesburg Laurel Regional Airport
+KPIE	27.9102	-82.687401	3.4	St. Petersburg Clearwater International Airport
+KPIH	42.909801	-112.596001	1357	Pocatello Regional Airport
+KPIR	44.382702	-100.286003	531.6	Pierre Regional Airport
+KPIT	40.491501	-80.232903	366.7	Pittsburgh International Airport
+KPKB	39.3451	-81.439201	261.5	Mid Ohio Valley Regional Airport
+KPLN	45.5709	-84.7967	219.8	Pellston Regional Airport of Emmet County Airport
+KPNS	30.472718	-87.186639	36.9	Pensacola International Airport
+KPQI	46.688999	-68.0448	162.8	Presque Isle International Airport
+KPRC	34.653502	-112.419883	1537.7	Prescott Regional Airport - Ernest A. Love Field
+KPSC	46.264702	-119.119003	125	Tri Cities Airport
+KPSM	43.078056	-70.823333	25.6	Portsmouth International at Pease ANGB
+KPSP	33.8297	-116.507004	145.4	Palm Springs International Airport
+KPUB	38.289101	-104.497002	1440.5	Pueblo Memorial Airport
+KPUW	46.741601	-117.11163	779.1	Pullman-Moscow Regional Airport
+KPVD	41.725038	-71.425668	16.8	Rhode Island T. F. Green International Airport
+KPVU	40.218894	-111.722445	1370.7	Provo Municipal Airport
+KPWM	43.646198	-70.309303	23.2	Portland International Jetport
+KRAP	44.0453	-103.056999	976.6	Rapid City Regional Airport
+KRDD	40.508999	-122.292999	153.9	Redding Municipal Airport
+KRDM	44.254101	-121.150002	938.8	Roberts Field
+KRDU	35.878659	-78.7873	132.6	Raleigh-Durham International Airport
+KRFD	42.1954	-89.097198	226.2	Chicago Rockford International Airport
+KRHI	45.631199	-89.467499	495	Rhinelander Oneida County Airport
+KRIC	37.505199	-77.319702	50.9	Richmond International Airport
+KRIW	43.064201	-108.459999	1684	Central Wyoming Regional Airport
+KRKD	44.060101	-69.099197	17.1	Knox County Regional Airport
+KRKS	41.5942	-109.065001	2061.7	Southwest Wyoming Regional Airport
+KRNO	39.4991	-119.767998	1345.7	Reno Tahoe International Airport
+KROA	37.3255	-79.975403	358.1	Roanoke–Blacksburg Regional Airport
+KROC	43.1189	-77.672401	170.4	Frederick Douglass Greater Rochester International Airport
+KROW	33.301601	-104.530998	1118.9	Roswell Air Center Airport
+KRST	43.908298	-92.5	401.4	Rochester International Airport
+KRSW	26.534685	-81.752816	9.1	Southwest Florida International Airport
+KRUT	43.5294	-72.9496	239.9	Rutland - Southern Vermont Regional Airport
+KSAF	35.617222	-106.089444	1935	Santa Fe Regional Airport
+KSAN	32.733601	-117.190002	5.2	San Diego International Airport
+KSAT	29.533694	-98.469778	242.9	San Antonio International Airport
+KSAV	32.126591	-81.19998	15.2	Savannah Hilton Head International Airport
+KSAW	46.351498	-87.395884	372.2	Marquette/Sawyer International Airport
+KSBA	34.426201	-119.839996	4	Santa Barbara Municipal Airport
+KSBD	34.096717	-117.236596	353.3	San Bernardino International Airport
+KSBN	41.708304	-86.316922	243.5	South Bend International Airport
+KSBP	35.236801	-120.641998	64.6	San Luis County Regional Airport
+KSBY	38.3405	-75.5103	15.8	Salisbury Ocean City Wicomico Regional Airport
+KSCK	37.893279	-121.238079	10.1	Stockton Metropolitan Airport
+KSDF	38.1706	-85.735076	152.7	Louisville Muhammad Ali International Airport
+KSDY	47.705141	-104.194422	605	Sidney - Richland Regional Airport
+KSEA	47.447943	-122.310276	132	Seattle–Tacoma International Airport
+KSFB	28.774277	-81.234626	16.8	Orlando Sanford International Airport
+KSFO	37.618972	-122.374889	4	San Francisco International Airport
+KSGF	37.245047	-93.388596	386.5	Springfield Branson National Airport
+KSGJ	29.9592	-81.339798	3	Northeast Florida Regional Airport
+KSGU	37.036389	-113.510306	896.4	St George Regional Airport
+KSHD	38.263802	-78.8964	366.1	Shenandoah Valley Regional Airport
+KSHR	44.769199	-106.980003	1225.6	Sheridan County Airport
+KSHV	32.444747	-93.826741	78.6	Shreveport Regional Airport
+KSJC	37.362375	-121.929022	18	San Jose International Airport
+KSJT	31.3577	-100.496002	584.9	San Angelo Regional Mathis Field
+KSJX	45.692299	-85.566597	203.9	Beaver Island Airport
+KSKX	36.452494	-105.67749	2162.6	Taos Regional Airport
+KSLC	40.788389	-111.977772	1288.1	Salt Lake City International Airport
+KSLE	44.9095	-123.002998	65.2	Salem-Willamette Valley Airport/McNary Field
+KSLK	44.38691	-74.204629	506.9	Adirondack Regional Airport
+KSLN	38.791	-97.652199	392.6	Salina Municipal Airport
+KSMF	38.6954	-121.591003	8.2	Sacramento International Airport
+KSMN	45.122233	-113.88196	1232.3	Lemhi County Airport
+KSMX	34.898899	-120.457001	79.6	Santa Maria Public Airport Captain G Allan Hancock Field
+KSNA	33.675667	-117.868222	17.1	John Wayne Airport Orange County
+KSOW	34.264062	-110.007091	1955.3	Show Low Regional Airport
+KSPI	39.844101	-89.677902	182.3	Abraham Lincoln Capital Airport
+KSPS	33.9888	-98.491898	310.6	Wichita Falls Municipal Airport / Sheppard Air Force Base
+KSQL	37.51313	-122.250838	1.5	San Carlos Airport
+KSRQ	27.394631	-82.554359	9.1	Sarasota Bradenton International Airport
+KSTC	45.5466	-94.059898	314.2	Saint Cloud Regional Airport
+KSTL	38.748697	-90.370003	188.4	St. Louis Lambert International Airport
+KSTS	38.508999	-122.813003	39	Charles M. Schulz Sonoma County Airport
+KSUN	43.504398	-114.295998	1620.9	Friedman Memorial Airport
+KSUX	42.397605	-96.382237	334.7	Sioux Gateway Airport / Brigadier General Bud Day Field
+KSVC	32.636701	-108.154736	1659.9	Grant County Airport
+KSWF	41.50421	-74.108901	149.7	New York Stewart International Airport
+KSWO	36.162132	-97.085581	304.8	Stillwater Regional Airport
+KSYR	43.111198	-76.1063	128.3	Syracuse Hancock International Airport
+KT89	29.278	-103.686997	801.6	Lajitas International Airport
+KTBN	37.7416	-92.140701	353.3	Waynesville-St. Robert Regional Airport-Forney Field
+KTEB	40.850101	-74.060799	2.7	Teterboro Airport
+KTEX	37.9538	-107.907997	2764.5	Telluride Regional Airport
+KTIW	47.267407	-122.577295	89.6	Tacoma Narrows Airport
+KTLH	30.401209	-84.35433	24.7	Tallahassee International Airport
+KTOL	41.5868	-83.8078	208.2	Eugene F. Kranz Toledo Express Airport
+KTPA	27.9755	-82.533203	7.9	Tampa International Airport
+KTRI	36.475201	-82.407401	463	Tri-Cities Regional TN/VA Airport
+KTRK	39.318628	-120.140562	1798.3	Truckee Tahoe Airport
+KTTN	40.276699	-74.813499	64.9	Trenton Mercer Airport
+KTUL	36.197084	-95.886225	206.3	Tulsa International Airport
+KTUP	34.268101	-88.769897	105.5	Tupelo Regional Airport
+KTUS	32.115004	-110.938053	805.6	Tucson International Airport
+KTVC	44.741402	-85.582199	190.2	Cherry Capital Airport
+KTVF	48.065701	-96.184998	341.1	Thief River Falls Regional Airport
+KTWF	42.4818	-114.487999	1266.1	Joslin Field Magic Valley Regional Airport
+KTXK	33.453701	-93.990997	118.9	Texarkana Regional Airport (Webb Field)
+KTYR	32.354099	-95.402397	165.8	Tyler Pounds Regional Airport
+KTYS	35.811001	-83.994003	299	McGhee Tyson Airport
+KUIN	39.942699	-91.194603	234.1	Quincy Regional Airport Baldwin Field
+KUNV	40.849374	-77.84852	377.6	State College Regional Airport
+KUUU	41.532207	-71.281039	52.4	Newport State Airport
+KVCT	28.8526	-96.918503	35.1	Victoria Regional Airport
+KVEL	40.436214	-109.511661	1608.7	Vernal Regional Airport
+KVLD	30.782499	-83.276703	61.9	Valdosta Regional Airport
+KVPS	30.481315	-86.515839	26.5	Destin-Fort Walton Beach Airport
+KVRB	27.6556	-80.417901	7.3	Vero Beach Regional Airport
+KWST	41.349602	-71.803398	24.7	Westerly State Airport
+KWYS	44.6884	-111.117996	2026.6	Yellowstone Airport
+KXNA	36.281898	-94.306801	392.3	Northwest Arkansas National Airport
+KXWA	48.260863	-103.75116	714.5	Williston Basin International Airport
+KYKM	46.568199	-120.543999	335	Yakima Air Terminal McAllister Field
