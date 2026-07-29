@@ -3,7 +3,7 @@
 # windblade.py:   Mission Planner, Flight Engine, and Launcher GUI
 # AUTHOR:         DANIEL DESAI
 # UPDATED:        2026-07-28
-# VERSION:        0.2.0
+# VERSION:        0.2.1
 #
 # Single standalone file: planning, build, simulate, and analyse all run
 # in-process here — `python3 windblade.py --auto ...` / `--manual ...` runs
@@ -52,6 +52,7 @@ import math
 import os
 import re
 import signal
+import socket
 import subprocess
 import sys
 import threading
@@ -60,7 +61,7 @@ import urllib.request
 import webbrowser
 from dataclasses import dataclass, field
 from datetime import UTC
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Optional
 from urllib.parse import urlparse
@@ -72,6 +73,7 @@ ROOT       = Path(__file__).parent.resolve()
 PLANNING   = ROOT / "planning"
 CONTROLS   = ROOT / "controls"
 ROTOR_CSV  = ROOT / "subsystems" / "propulsion" / "rotor_config.csv"
+TERRAIN_JL = ROOT / "world" / "terrain.jl"
 
 # ── Physical constants ────────────────────────────────────────────────────────
 R_DRY_AIR    = 287.058
@@ -88,6 +90,28 @@ SRTM_MIRRORS = [
     "https://opentopography.s3.sdsc.edu/raster/SRTM_GL3/SRTM_GL3_srtm/{tile}.hgt",
     "https://dds.cr.usgs.gov/srtm/version2_1/SRTM3/North_America/{tile}.hgt.zip",
 ]
+
+# ── Live weather ──────────────────────────────────────────────────────────────
+# The browser cannot hit aviationweather.gov directly (no CORS headers), so
+# GET /metar proxies it server-side.  Timeouts are deliberately short: the
+# handler thread is blocked while they run and the Launch button waits on it.
+METAR_HOST     = "aviationweather.gov"
+METAR_URL      = "https://aviationweather.gov/api/data/metar?ids={icao}&format=raw"
+METAR_UA       = "windblade.py/0.2.0 (eVTOL mission planner; single-user desktop tool)"
+METAR_TIMEOUT  = 5.0      # s — HTTP fetch
+METAR_TTL_S    = 600.0    # s — in-memory cache lifetime (~10 min, one obs cycle)
+NET_PROBE_TIMEOUT = 2.0   # s — TCP connect for the connectivity probe
+NET_PROBE_TTL_S   = 30.0  # s — how long a probe result is reused
+
+# Bundled reference observations for the default route.  These are the two
+# literal strings that used to be the METAR textarea defaults; they survive the
+# textarea→ICAO change as fallback constants.  Used only when a live fetch for
+# these two stations fails or comes back empty — for any other airport the
+# fallback is the ISA lapse-rate METAR from synthetic_metar().
+BUNDLED_METAR = {
+    "KAXX": "KAXX 151155Z 00000KT 10SM CLR M01/M10 A3018 RMK AO2 T10141096",
+    "KSAF": "KSAF 151153Z 24005KT 10SM CLR 13/M09 A3005 RMK AO2 T01281094",
+}
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  Logging — one seam, five helpers. Every log line in the engine, the build
@@ -436,10 +460,11 @@ class Airport:
     lat:    float
     lon:    float
     elev_m: float
+    name:   str = ""
 
 
 def load_airports() -> dict[str, Airport]:
-    """CSV format (header required): icao,lat_deg,lon_deg,elev_m"""
+    """CSV format (header required): icao,lat_deg,lon_deg,elev_m[,name]"""
     path = PLANNING / "airports.csv"
     out: dict[str, Airport] = {}
     if not path.exists():
@@ -451,7 +476,8 @@ def load_airports() -> dict[str, Airport]:
                 out[icao] = Airport(icao=icao,
                                     lat=float(row["lat_deg"]),
                                     lon=float(row["lon_deg"]),
-                                    elev_m=float(row["elev_m"]))
+                                    elev_m=float(row["elev_m"]),
+                                    name=(row.get("name") or "").strip())
             except (KeyError, ValueError):
                 continue
     return out
@@ -491,8 +517,24 @@ class MetarData:
     raw:           str   = ""
 
 
+_METAR_REPORT_TYPE_RE = re.compile(r'^(?:METAR|SPECI)\s+', re.IGNORECASE)
+
+
+def strip_report_type(raw: str) -> str:
+    """Drop a leading METAR/SPECI report-type token. aviationweather.gov's
+    raw text sometimes carries it (SPECI marks an unscheduled special
+    report) — everything downstream, here and in the GUI's manual-entry
+    ICAO check, expects the station identifier to be the first token."""
+    raw = (raw or "").strip()
+    prev = None
+    while prev != raw:               # tolerate a stray double prefix
+        prev = raw
+        raw = _METAR_REPORT_TYPE_RE.sub("", raw, count=1).strip()
+    return raw
+
+
 def parse_metar(raw: str) -> MetarData:
-    raw   = raw.strip()
+    raw   = strip_report_type(raw)
     parts = raw.split()
     if not parts:
         raise ValueError("Empty METAR")
@@ -531,6 +573,361 @@ def parse_metar(raw: str) -> MetarData:
 
 def read_metar(path: Path) -> MetarData:
     return parse_metar(path.read_text(encoding="utf-8", errors="replace").strip())
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  Weather & terrain auto-resolution
+#
+#  The Route & Weather tab takes ICAO codes only.  Everything below turns a
+#  dep/arr ICAO pair into the raw METAR text the rest of the pipeline already
+#  expects — dep_metar/arr_metar stay raw strings on the wire into /launch →
+#  plan_flight → generate_test_card, so nothing downstream changes.
+#
+#  Four inputs drive the decision table: internet, both airports in
+#  airports.csv, METAR text available for both ends (live, cached, manually
+#  entered, or bundled), and a predefined terrain pair in terrain.jl.
+# ══════════════════════════════════════════════════════════════════════════════
+
+ICAO_RE = re.compile(r"^[A-Z0-9]{4}$")
+
+# Actions — the six the decision table can produce.
+ACT_FLY         = "fly"                  # everything resolved, go
+ACT_SRTM        = "srtm_then_fly"        # no predefined profile: download SRTM first
+ACT_SYNTHETIC   = "synthetic_metar"      # no obs: ISA lapse-rate METAR from field elevation
+ACT_MANUAL      = "manual_metar"         # offline: require manual METAR entry
+ACT_MANUAL_FLAT = "manual_metar_flat"    # offline, no predefined pair: manual METAR + flat world
+ACT_NO_FLY      = "do_not_fly"
+
+# Key: (internet, both_airports_in_db, metar_available, predefined_pair).
+#
+# Seven rows are specified.  The remaining nine (marked "default") were never
+# signed off on, so they take the most restrictive of the six actions rather
+# than a guessed-at graceful degradation.  Revisit them deliberately — do not
+# silently smarten them up.
+DECISION_TABLE: dict[tuple[bool, bool, bool, bool], str] = {
+    (True,  True,  True,  True ): ACT_FLY,
+    (True,  True,  True,  False): ACT_SRTM,
+    (True,  True,  False, True ): ACT_SYNTHETIC,
+    (True,  True,  False, False): ACT_NO_FLY,       # default
+    (True,  False, True,  True ): ACT_NO_FLY,
+    (True,  False, True,  False): ACT_NO_FLY,       # default
+    (True,  False, False, True ): ACT_NO_FLY,       # default
+    (True,  False, False, False): ACT_NO_FLY,       # default
+    # Offline: "METAR available" can only be true because someone typed it in,
+    # so every offline row that can fly at all requires manual entry first.
+    (False, True,  True,  True ): ACT_MANUAL,
+    (False, True,  True,  False): ACT_MANUAL_FLAT,
+    (False, True,  False, True ): ACT_MANUAL,
+    (False, True,  False, False): ACT_MANUAL_FLAT,
+    (False, False, True,  True ): ACT_NO_FLY,       # default
+    (False, False, True,  False): ACT_NO_FLY,       # default
+    (False, False, False, True ): ACT_NO_FLY,       # default
+    (False, False, False, False): ACT_NO_FLY,
+}
+
+
+# ── Internet connectivity probe ───────────────────────────────────────────────
+
+_net_lock  = threading.Lock()
+_net_state: tuple[float, bool] | None = None   # (monotonic_at, reachable)
+
+
+def has_internet(force: bool = False) -> bool:
+    """TCP-connect to the METAR host — DNS + handshake only, no request body.
+    Cached for NET_PROBE_TTL_S; force=True re-checks (every launch attempt
+    does, rather than trusting a probe from minutes ago)."""
+    global _net_state
+    now = time.monotonic()
+    if not force:
+        with _net_lock:
+            if _net_state and (now - _net_state[0]) < NET_PROBE_TTL_S:
+                return _net_state[1]
+    try:
+        socket.create_connection((METAR_HOST, 443),
+                                 timeout=NET_PROBE_TIMEOUT).close()
+        ok = True
+    except OSError:
+        ok = False
+    with _net_lock:
+        _net_state = (now, ok)
+    return ok
+
+
+# ── METAR fetch (server-side proxy for GET /metar) ────────────────────────────
+
+@dataclass
+class MetarFetch:
+    icao:    str
+    raw:     str   = ""
+    status:  str   = "error"   # live | cache | bundled | empty | error | invalid
+    age_s:   Optional[float] = None
+    message: str   = ""
+
+    @property
+    def usable(self) -> bool:
+        return bool(self.raw)
+
+
+_metar_cache: dict[str, tuple[float, str]] = {}   # icao -> (unix_fetched_at, raw)
+_metar_lock  = threading.Lock()                   # same pattern as _sim_lock
+
+
+def fetch_metar(icao: str, allow_network: bool = True) -> MetarFetch:
+    """Resolve one station's observation.  Cache hit → cache; live fetch →
+    live; station reporting nothing → empty (a distinct, non-fatal case);
+    network trouble → error, falling back to a stale cache entry if there is
+    one.  Never raises: every caller degrades instead of blocking Launch."""
+    icao = (icao or "").strip().upper()
+    if not ICAO_RE.match(icao):
+        return MetarFetch(icao=icao, status="invalid",
+                          message="ICAO must be 4 letters/digits")
+
+    now = time.time()
+    with _metar_lock:
+        hit = _metar_cache.get(icao)
+    if hit and (now - hit[0]) < METAR_TTL_S:
+        return MetarFetch(icao=icao, raw=hit[1], status="cache",
+                          age_s=now - hit[0])
+
+    def stale(msg: str) -> MetarFetch:
+        if hit:
+            return MetarFetch(icao=icao, raw=hit[1], status="cache",
+                              age_s=now - hit[0], message=f"{msg}; using cached obs")
+        return MetarFetch(icao=icao, status="error", message=msg)
+
+    if not allow_network:
+        return stale("offline")
+
+    req = urllib.request.Request(METAR_URL.format(icao=icao),
+                                 headers={"User-Agent": METAR_UA})
+    try:
+        with urllib.request.urlopen(req, timeout=METAR_TIMEOUT) as resp:
+            body = resp.read().decode("utf-8", errors="replace")
+    except Exception as e:                       # URLError, timeout, HTTPError…
+        return stale(f"fetch failed: {e}")
+
+    raw = next((ln.strip() for ln in body.splitlines() if ln.strip()), "")
+    raw = strip_report_type(raw)
+    if not raw:
+        # Station exists but has no current observation — not an error, and
+        # not something to cache.
+        return MetarFetch(icao=icao, status="empty",
+                          message="station reported no current observation")
+
+    with _metar_lock:
+        _metar_cache[icao] = (now, raw)
+    return MetarFetch(icao=icao, raw=raw, status="live", age_s=0.0)
+
+
+# ── Predefined terrain pairs (read from terrain.jl) ───────────────────────────
+
+# Matches the dict entries in terrain.jl's PREDEFINED_PROFILES ("KDEP-KARR" =>).
+# Parsed out of the source rather than duplicated here so the two cannot drift.
+_PREDEF_KEY_RE = re.compile(r'"([A-Z0-9]{4})-([A-Z0-9]{4})"\s*=>')
+_predef_cache: tuple[float, frozenset[str]] | None = None
+_predef_lock  = threading.Lock()
+
+
+def predefined_pairs() -> frozenset[str]:
+    """Route keys with a hardcoded profile in terrain.jl.  Empty set if the
+    file is missing — that reads as "no predefined pair", the conservative
+    side of the table."""
+    global _predef_cache
+    try:
+        mtime = TERRAIN_JL.stat().st_mtime
+    except OSError:
+        return frozenset()
+    with _predef_lock:
+        if _predef_cache and _predef_cache[0] == mtime:
+            return _predef_cache[1]
+    try:
+        src = TERRAIN_JL.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return frozenset()
+    # Drop line comments first — terrain.jl documents the key format with a
+    # literal "KDEP-KARR" => ... example that is not a real route.
+    code = "\n".join(ln.split("#", 1)[0] for ln in src.splitlines())
+    keys = frozenset(f"{a}-{b}" for a, b in _PREDEF_KEY_RE.findall(code))
+    with _predef_lock:
+        _predef_cache = (mtime, keys)
+    return keys
+
+
+def has_predefined_pair(dep_icao: str, arr_icao: str) -> bool:
+    """True if terrain.jl can serve this route from PREDEFINED_PROFILES.
+    Either direction counts — load_terrain reverses a stored profile."""
+    keys = predefined_pairs()
+    dep, arr = dep_icao.upper(), arr_icao.upper()
+    return f"{dep}-{arr}" in keys or f"{arr}-{dep}" in keys
+
+
+# ── Synthetic METAR (ISA standard day at field elevation) ─────────────────────
+
+def _metar_temp_group(temp_c: float) -> str:
+    v = int(round(temp_c))
+    return f"M{abs(v):02d}" if v < 0 else f"{v:02d}"
+
+
+def synthetic_metar(ap: Airport) -> str:
+    """ISA standard day at ap.elev_m, emitted as raw METAR text so it rides the
+    same wire as a real observation (plan_flight parses raw).  Temperature
+    comes off the standard lapse rate; QNH is 1013 hPa by definition of ISA —
+    the field-elevation correction happens downstream in station_pressure().
+    Calm wind.  Dewpoint is cosmetic: nothing downstream reads it."""
+    temp_c  = (STD_TEMP_K - LAPSE_RATE * ap.elev_m) - 273.15
+    qnh_hpa = int(round(STD_PRESSURE / 100.0))
+    stamp   = datetime.datetime.now(UTC).strftime("%d%H%MZ")
+    return (f"{ap.icao} {stamp} 00000KT 9999 "
+            f"{_metar_temp_group(temp_c)}/{_metar_temp_group(temp_c - 5.0)} "
+            f"Q{qnh_hpa:04d} RMK SYNTHETIC ISA")
+
+
+# ── Route resolution ──────────────────────────────────────────────────────────
+
+@dataclass
+class RouteResolution:
+    ok:            bool
+    action:        str
+    message:       str
+    dep_metar:     str  = ""
+    arr_metar:     str  = ""
+    force_terrain: Optional[bool] = None   # True: fetch SRTM · False: flat world
+                                           # None: leave the GUI toggle alone
+    need_manual:   list[str] = field(default_factory=list)   # ["dep", "arr"]
+    suggest:       dict = field(default_factory=dict)        # prefill for manual entry
+    log:           list[str] = field(default_factory=list)
+
+
+def _resolve_one(icao: str, manual: str, internet: bool) -> tuple[str, str]:
+    """(raw_metar, source) for one end.  Manual text wins, then live/cached,
+    then the bundled reference for the default route.  '' if nothing."""
+    manual = (manual or "").strip()
+    if manual:
+        return manual, "manual"
+    f = fetch_metar(icao, allow_network=internet)
+    if f.usable:
+        return f.raw, f.status
+    bundled = BUNDLED_METAR.get(icao)
+    if bundled:
+        return bundled, "bundled"
+    return "", f.status
+
+
+def resolve_route(dep_icao: str, arr_icao: str,
+                  dep_manual: str = "", arr_manual: str = "",
+                  force_net_probe: bool = False) -> RouteResolution:
+    """Evaluate the decision table for one dep→arr pair and return either the
+    raw METAR pair to fly with, or a refusal explaining which input failed."""
+    dep_icao = (dep_icao or "").strip().upper()
+    arr_icao = (arr_icao or "").strip().upper()
+    dep_manual = strip_report_type(dep_manual)
+    arr_manual = strip_report_type(arr_manual)
+
+    bad = [f"{lbl}={c or '(blank)'}"
+           for lbl, c in (("departure", dep_icao), ("arrival", arr_icao))
+           if not ICAO_RE.match(c)]
+    if bad:
+        return RouteResolution(
+            ok=False, action=ACT_NO_FLY,
+            message=f"Invalid ICAO code: {', '.join(bad)} — "
+                    f"expected four letters or digits.")
+
+    # plan_flight takes the airport from the METAR's first token, so a manual
+    # paste that disagrees with the ICAO field would silently fly a different
+    # route than the one on screen.
+    for label, icao, manual in (("Departure", dep_icao, dep_manual),
+                                ("Arrival",   arr_icao, arr_manual)):
+        first = (manual or "").strip().split()
+        if first and first[0].upper() != icao:
+            return RouteResolution(
+                ok=False, action=ACT_NO_FLY,
+                message=f"{label} METAR is for {first[0].upper()}, not {icao} — "
+                        f"fix the ICAO field or the pasted text.")
+
+    airports = load_airports()
+    missing  = [c for c in (dep_icao, arr_icao) if c not in airports]
+    in_db    = not missing
+
+    internet   = has_internet(force=force_net_probe)
+    dep_raw, dep_src = _resolve_one(dep_icao, dep_manual, internet)
+    arr_raw, arr_src = _resolve_one(arr_icao, arr_manual, internet)
+    metar_ok   = bool(dep_raw and arr_raw)
+    predefined = has_predefined_pair(dep_icao, arr_icao)
+
+    action = DECISION_TABLE[(internet, in_db, metar_ok, predefined)]
+
+    log = [
+        f"Weather/terrain resolution — internet={'yes' if internet else 'no'}  "
+        f"airports in DB={'yes' if in_db else 'no'}  "
+        f"METAR available={'yes' if metar_ok else 'no'}  "
+        f"predefined terrain pair={'yes' if predefined else 'no'}  "
+        f"→ {action}",
+        f"DEP {dep_icao}: {dep_src}    ARR {arr_icao}: {arr_src}",
+    ]
+    state = (f"(internet={'yes' if internet else 'no'}, "
+             f"airports in DB={'yes' if in_db else 'no'}, "
+             f"METAR={'yes' if metar_ok else 'no'}, "
+             f"predefined terrain={'yes' if predefined else 'no'})")
+
+    if action == ACT_NO_FLY:
+        why = (f"{' and '.join(missing)} not in planning/airports.csv"
+               if missing else
+               "no weather available and no predefined terrain profile for this route"
+               if internet else
+               "offline with no usable inputs")
+        return RouteResolution(ok=False, action=action, log=log,
+                               message=f"Do not fly — {why} {state}.")
+
+    if action in (ACT_MANUAL, ACT_MANUAL_FLAT):
+        flat = action == ACT_MANUAL_FLAT
+        need = [w for w, m in (("dep", dep_manual), ("arr", arr_manual))
+                if not (m or "").strip()]
+        if need:
+            # Offline, so anything we "have" was not fetched live — the user
+            # confirms it by hand.  Bundled reference text is offered as a
+            # prefill, never assumed.
+            suggest = {w: BUNDLED_METAR[c]
+                       for w, c in (("dep", dep_icao), ("arr", arr_icao))
+                       if c in BUNDLED_METAR and w in need}
+            return RouteResolution(
+                ok=False, action=action, need_manual=need, suggest=suggest, log=log,
+                message=("No internet — enter the METAR for "
+                         f"{' and '.join(need)} manually before launching"
+                         + (" (terrain falls back to the flat world model: no "
+                            "predefined profile for this route)" if flat else "")
+                         + f" {state}."))
+        log.append("Offline: flying on manually entered METARs"
+                   + (" with flat-world terrain" if flat else ""))
+        return RouteResolution(ok=True, action=action, log=log,
+                               dep_metar=dep_manual.strip(),
+                               arr_metar=arr_manual.strip(),
+                               force_terrain=False if flat else None,
+                               message="Manual METARs accepted.")
+
+    if action == ACT_SYNTHETIC:
+        for icao, raw, which in ((dep_icao, dep_raw, "dep"), (arr_icao, arr_raw, "arr")):
+            if not raw:
+                gen = synthetic_metar(airports[icao])
+                log.append(f"{which.upper()} {icao}: no observation — "
+                           f"synthetic ISA METAR from {airports[icao].elev_m:.0f} m field "
+                           f"elevation: {gen}")
+                if which == "dep": dep_raw = gen
+                else:              arr_raw = gen
+        return RouteResolution(ok=True, action=action, log=log,
+                               dep_metar=dep_raw, arr_metar=arr_raw,
+                               message="Flying on synthetic ISA weather.")
+
+    if action == ACT_SRTM:
+        log.append("No predefined terrain profile for this route — "
+                   "SRTM download enabled for this run")
+        return RouteResolution(ok=True, action=action, log=log,
+                               dep_metar=dep_raw, arr_metar=arr_raw,
+                               force_terrain=True,
+                               message="SRTM terrain will be built before the run.")
+
+    return RouteResolution(ok=True, action=ACT_FLY, log=log,
+                           dep_metar=dep_raw, arr_metar=arr_raw,
+                           message="Route resolved.")
 
 
 # ── Geodesy helpers ────────────────────────────────────────────────────────────
@@ -1696,17 +2093,41 @@ html,body{background:var(--bg);color:var(--nw);font-family:var(--mono);font-size
 
     <!-- Route & Weather -->
     <div class="panel active" id="panel-route">
-      <div class="sec">Departure — METAR</div>
-      <div class="field">
-        <label>METAR_DEP</label>
-        <textarea id="dep-metar" rows="3" oninput="sync()">KAXX 151155Z 00000KT 10SM CLR M01/M10 A3018 RMK AO2 T10141096</textarea>
+      <div class="sec">Route</div>
+      <div class="row2">
+        <div class="field"><label>Departure ICAO</label>
+          <input id="dep-icao" value="KAXX" maxlength="4" placeholder="KAXX"
+                 oninput="icaoChanged('dep')" onblur="fetchWx('dep')"></div>
+        <div class="field"><label>Arrival ICAO</label>
+          <input id="arr-icao" value="KSAF" maxlength="4" placeholder="KSAF"
+                 oninput="icaoChanged('arr')" onblur="fetchWx('arr')"></div>
       </div>
-      <div class="sec">Arrival — METAR</div>
-      <div class="field">
-        <label>METAR_ARR</label>
-        <textarea id="arr-metar" rows="3" oninput="sync()">KSAF 151153Z 24005KT 10SM CLR 13/M09 A3005 RMK AO2 T01281094</textarea>
+      <div class="ts" id="route-info" style="margin-top:-8px;margin-bottom:18px"></div>
+
+      <div class="sec">Weather</div>
+      <div class="row2">
+        <div class="field"><label>METAR_DEP <span id="dep-age" class="c-dim"></span></label>
+          <textarea id="dep-wx" rows="3" readonly></textarea></div>
+        <div class="field"><label>METAR_ARR <span id="arr-age" class="c-dim"></span></label>
+          <textarea id="arr-wx" rows="3" readonly></textarea></div>
       </div>
-      <div class="callout" style="margin-top:20px">Paste real METARs here — passed directly into the flight engine. No planning/ files are written for weather. The ICAO code is read from the first token.</div>
+
+      <div class="callout">Weather and terrain resolve automatically at launch. METARs sourced from aviationweather.gov. Terrain for the route from a predefined profile in <code>terrain.jl</code>, else a SRTM download, otherwise a flat-world model. If a station is reporting nothing, a nominal METAR is constructed from its elevation. Both airports must exist in <code>planning/airports.csv</code>.</div>
+
+      <div class="toggle-row" style="cursor:pointer" onclick="toggleManual()">
+        <div><div class="tl">Paste METARs manually instead</div>
+          <div class="ts">Required with no internet; also the fallback if the fetch endpoint is down</div></div>
+        <div class="switch" id="sw-manual"></div>
+      </div>
+      <div id="manual-wrap" style="display:none;margin-top:18px">
+        <div class="row2">
+          <div class="field"><label>METAR_DEP — manual</label>
+            <textarea id="dep-metar" rows="3" oninput="sync()"></textarea></div>
+          <div class="field"><label>METAR_ARR — manual</label>
+            <textarea id="arr-metar" rows="3" oninput="sync()"></textarea></div>
+        </div>
+        <div class="callout warn">Manual text overrides the fetched observation. The first token must match the ICAO above.</div>
+      </div>
     </div>
 
     <!-- Flight params -->
@@ -1754,7 +2175,7 @@ html,body{background:var(--bg);color:var(--nw);font-family:var(--mono);font-size
         <div class="switch" id="sw-turb" onclick="tog(this,'turb')"></div>
       </div>
       <div class="toggle-row">
-        <div><div class="tl">Download SRTM terrain</div><div class="ts">Force terrain profile refresh for this route</div></div>
+        <div><div class="tl">Download SRTM terrain</div><div class="ts">Force terrain profile refresh — enabled automatically when the route has no predefined profile</div></div>
         <div class="switch" id="sw-terrain" onclick="tog(this,'terrain')"></div>
       </div>
       <div class="toggle-row">
@@ -1854,6 +2275,85 @@ function tog(el,key){
 }
 
 function v(id){return document.getElementById(id).value.trim();}
+
+/* ── Weather resolution (client half) ───────────────────────────────────────
+   The ICAO inputs are the only weather input; GET /metar proxies
+   aviationweather.gov server-side and the resolved text is read-only. The
+   manual textareas below are the offline / endpoint-down path — the server
+   resolves the full decision table again at launch either way. */
+var wxTimer={dep:null,arr:null};
+var manualOpen=false;
+var airportData={};
+
+function loadAirports(){
+  fetch('/airports').then(r=>r.json()).then(function(d){airportData=d;updateRouteInfo();}).catch(function(){});
+}
+
+function haversineKm(lat1,lon1,lat2,lon2){
+  var R=6371.0,toRad=function(d){return d*Math.PI/180;};
+  var dLat=toRad(lat2-lat1),dLon=toRad(lon2-lon1);
+  var a=Math.sin(dLat/2)*Math.sin(dLat/2)
+      +Math.cos(toRad(lat1))*Math.cos(toRad(lat2))*Math.sin(dLon/2)*Math.sin(dLon/2);
+  return 2*R*Math.asin(Math.sqrt(Math.min(1,a)));
+}
+
+function updateRouteInfo(){
+  var el=document.getElementById('route-info');
+  if(!el)return;
+  var dep=v('dep-icao').toUpperCase(),arr=v('arr-icao').toUpperCase();
+  var da=airportData[dep],aa=airportData[arr];
+  var depLbl=dep?(da?(da.name||dep):dep+' — not in airports.csv'):'?';
+  var arrLbl=arr?(aa?(aa.name||arr):arr+' — not in airports.csv'):'?';
+  var dist=(da&&aa)?' — '+haversineKm(da.lat,da.lon,aa.lat,aa.lon).toFixed(1)+' km':'';
+  el.textContent=depLbl+'  →  '+arrLbl+dist;
+}
+
+function icaoChanged(which){
+  var el=document.getElementById(which+'-icao');
+  el.value=el.value.toUpperCase();
+  updateRouteInfo();
+  clearTimeout(wxTimer[which]);
+  wxTimer[which]=setTimeout(function(){fetchWx(which);},600);
+}
+
+function fetchWx(which){
+  clearTimeout(wxTimer[which]);
+  var icao=v(which+'-icao').toUpperCase();
+  var box=document.getElementById(which+'-wx'),age=document.getElementById(which+'-age');
+  if(!/^[A-Z0-9]{4}$/.test(icao)){box.value='';age.textContent='— invalid ICAO';age.className='c-warn';return;}
+  age.textContent='— fetching...';age.className='c-dim';
+  fetch('/metar?icao='+encodeURIComponent(icao))
+    .then(r=>r.json())
+    .then(d=>{
+      box.value=d.raw||'';
+      if(d.raw){
+        var mins=(d.age_s!=null)?', '+Math.round(d.age_s/60)+' min old':'';
+        age.textContent='— '+d.status+mins;
+        age.className=(d.status==='bundled')?'c-warn':'c-ok';
+      }else{
+        age.textContent='— '+(d.message||d.status);
+        age.className='c-warn';
+      }
+    })
+    .catch(function(){box.value='';age.textContent='— /metar unreachable';age.className='c-warn';});
+}
+
+function toggleManual(open){
+  manualOpen=(open===undefined)?!manualOpen:!!open;
+  document.getElementById('manual-wrap').style.display=manualOpen?'block':'none';
+  document.getElementById('sw-manual').classList.toggle('on',manualOpen);
+}
+
+/* Launch refused for want of a hand-entered METAR: open the manual block and
+   prefill whichever ends have a bundled reference. Nothing is submitted — the
+   user confirms the text and launches again. */
+function openManual(need,suggest){
+  toggleManual(true);
+  (need||[]).forEach(function(w){
+    var el=document.getElementById(w+'-metar');
+    if(el&&!el.value.trim()&&suggest&&suggest[w])el.value=suggest[w];
+  });
+}
 
 function buildCmd(){
   var mode=v('mode'),sf=v('sfactor');
@@ -2111,12 +2611,14 @@ function renderRotorDisks(rotors){
   el.innerHTML = html;
 }
 
+function wxText(which){
+  return v(which+'-metar')||v(which+'-wx')||(v(which+'-icao')||'?')+' (resolved at launch)';
+}
+
 function renderChecklist(){
-  var depIcao=v('dep-metar').split(' ')[0]||'?';
-  var arrIcao=v('arr-metar').split(' ')[0]||'?';
   var rows=[
-    ['DEP',    v('dep-metar').substring(0,65), 'var(--ga)'],
-    ['ARR',    v('arr-metar').substring(0,65), 'var(--ga)'],
+    ['DEP',    wxText('dep').substring(0,60), 'var(--ga)'],
+    ['ARR',    wxText('arr').substring(0,60), 'var(--ga)'],
     ['CRUISE', v('speed')+' km/h  /  '+v('alt')+' ft MSL  /  hover '+v('hover')+' m', 'var(--ga)'],
     ['MODE',   v('mode').toUpperCase()+'  x'+v('sfactor'), 'var(--ga)'],
     ['ROTORS', rotorData.length+' rotors'+fleetModeSummary()+' — '+
@@ -2138,7 +2640,9 @@ function logClear(){
 
 function getConfig(){
   return{
-    dep_metar: v('dep-metar'),
+    dep_icao:  v('dep-icao').toUpperCase(),
+    arr_icao:  v('arr-icao').toUpperCase(),
+    dep_metar: v('dep-metar'),   /* manual override, empty unless pasted */
     arr_metar: v('arr-metar'),
     cruise:{speed_kmh:parseFloat(v('speed'))||296,altitude_ft:parseFloat(v('alt'))||11000,hover_alt_m:parseFloat(v('hover'))||30,back_trans_speed_ms:parseFloat(v('bt-speed'))||50,nacelle_tilt_deg:Math.min(90,Math.max(45,parseFloat(v('nacelle-tilt'))||65))},
     sim:{mode:v('mode'),speed_factor:parseInt(v('sfactor'))||1,
@@ -2164,7 +2668,12 @@ function _launch(){
         logLine('<span class="ga">[ launch_sim ]  started</span>');
         pollLog(0);
       } else {
-        logLine('<span class="rd">error: '+(d.message||'unknown')+'</span>');
+        logLine('<span class="rd">'+(d.message||'error: unknown')+'</span>');
+        if(d.need_manual&&d.need_manual.length){
+          openManual(d.need_manual,d.suggest);
+          logLine('<span class="yl">[ launch_sim ]  manual METAR entry opened on Route &amp; weather</span>');
+        }
+        document.getElementById('statusbar').textContent='launch refused — '+(d.action||'error');
         resetLaunch();
       }
     })
@@ -2264,6 +2773,9 @@ function loadResults(f){
 }
 
 loadRotors();
+loadAirports();
+fetchWx('dep');
+fetchWx('arr');
 sync();
 </script>
 </body>
@@ -2308,6 +2820,11 @@ def _run_sim(cfg: dict) -> None:
 
     install_sink()
     try:
+        # Resolution happened in the /launch handler, before the sink existed —
+        # replay its lines here so they land in the browser log.
+        for line in cfg.get("_wx_log") or []:
+            info(line)
+
         dep_metar = cfg.get("dep_metar", "").strip()
         arr_metar = cfg.get("arr_metar", "").strip()
         cru       = cfg.get("cruise", {})
@@ -2410,6 +2927,26 @@ class _Handler(BaseHTTPRequestHandler):
                 "source": source, "locked": _is_running(),
             })
 
+        elif path == "/airports":
+            airports = load_airports()
+            self._send_json(200, {
+                icao: {"name": a.name, "lat": a.lat, "lon": a.lon, "elev_m": a.elev_m}
+                for icao, a in airports.items()
+            })
+
+        elif path == "/metar":
+            from urllib.parse import parse_qs
+            qs   = parse_qs(urlparse(self.path).query)
+            icao = (qs.get("icao", [""])[0] or "").strip().upper()
+            f    = fetch_metar(icao, allow_network=has_internet())
+            if not f.usable and icao in BUNDLED_METAR:
+                f = MetarFetch(icao=icao, raw=BUNDLED_METAR[icao], status="bundled",
+                               message="bundled reference observation")
+            self._send_json(200, {
+                "icao": f.icao, "raw": f.raw, "status": f.status,
+                "age_s": f.age_s, "message": f.message,
+            })
+
         elif path == "/card":
             card_path = PLANNING / "test_card.json"
             if card_path.exists():
@@ -2466,6 +3003,32 @@ class _Handler(BaseHTTPRequestHandler):
             except json.JSONDecodeError as e:
                 self._send_json(400, {"status": "error", "message": str(e)})
                 return
+
+            # ICAO-driven client: resolve weather and terrain against the
+            # decision table before anything starts.  A refusal comes back on
+            # this response — the run never begins — except on a no-plan run,
+            # where the existing test_card.json is what flies and the
+            # resolution is advisory only.
+            if cfg.get("dep_icao") or cfg.get("arr_icao"):
+                res = resolve_route(cfg.get("dep_icao", ""), cfg.get("arr_icao", ""),
+                                    cfg.get("dep_metar", "") or "",
+                                    cfg.get("arr_metar", "") or "",
+                                    force_net_probe=True)
+                advisory = bool((cfg.get("sim") or {}).get("no_plan"))
+                if not res.ok and not advisory:
+                    self._send_json(200, {
+                        "status": "error", "message": res.message,
+                        "action": res.action, "need_manual": res.need_manual,
+                        "suggest": res.suggest,
+                    })
+                    return
+                cfg["_wx_log"] = res.log + ([] if res.ok else
+                                            [f"no_plan: {res.message} — flying the "
+                                             f"existing test card anyway"])
+                if res.dep_metar: cfg["dep_metar"] = res.dep_metar
+                if res.arr_metar: cfg["arr_metar"] = res.arr_metar
+                if res.force_terrain is not None:
+                    cfg.setdefault("sim", {})["terrain"] = res.force_terrain
 
             global _sim_log, _sim_done, _sim_rc
             with _sim_lock:
@@ -2558,7 +3121,9 @@ def main() -> int:
     info(f"Rotor CSV:      {ROTOR_CSV}")
     info(f"Press  {YL}Ctrl+C{NC}  to stop\n")
 
-    server = HTTPServer(("localhost", args.port), _Handler)
+    # Threaded: /metar and /launch both block on network I/O now, and a
+    # single-threaded server would stall log polling while they run.
+    server = ThreadingHTTPServer(("localhost", args.port), _Handler)
     if not args.no_browser:
         threading.Timer(0.4, lambda: webbrowser.open(url)).start()
 
