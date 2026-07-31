@@ -26,7 +26,7 @@ function readTheme() {
     stroke: v("--stroke"), strokeHi: v("--stroke-hi"),
     text: v("--text"), dim: v("--text-dim"), faint: v("--text-faint"),
     green: v("--green"), amber: v("--amber"), red: v("--red"),
-    blue: v("--blue"), sky: v("--sky"), ground: v("--ground"),
+    blue: v("--blue"), navAccent: v("--nav-accent"), sky: v("--sky"), ground: v("--ground"),
     bugFill: v("--bug-fill"),
   };
 }
@@ -87,6 +87,7 @@ const trend = [];         // ring buffer {t, spd, alt} for 6-s trend vectors
 let linkUp = false;
 const M2FT = 3.28084;
 const KMH2KT = 0.539957;  // display-only conversion; wire format / VCON thresholds stay km/h
+const M2NM = 1 / 1852;    // display-only conversion; wire format / geometry stay metres
 
 /* Radar altitude in feet: alt_agl_terrain_m is height above the terrain
  * directly below (what a radalt actually senses); fall back to CG AGL. */
@@ -172,7 +173,8 @@ function trend6(key) {
  *  TAPES — speed (right-edge ticks) / altitude (left-edge ticks)
  * ══════════════════════════════════════════════════════════════════ */
 function drawTape(id, value, half, majorStep, minorStep, label, unit,
-                  flip, trendDelta) {
+                  flip, trendDelta, valueCol) {
+  if (valueCol === undefined) valueCol = TH.text;
   const c = begin(id), { ctx, w, h } = c;
   const y = (v) => h * (0.5 - (v - value) / (2 * half));
 
@@ -226,7 +228,7 @@ function drawTape(id, value, half, majorStep, minorStep, label, unit,
   ctx.closePath();
   ctx.fillStyle = TH.bugFill; ctx.fill();
   ctx.strokeStyle = TH.text; ctx.lineWidth = 1.2; ctx.stroke();
-  txt(ctx, fmt(value), w / 2, h / 2, FM(19, 700), TH.text);
+  txt(ctx, fmt(value), w / 2, h / 2, FM(19, 700), valueCol);
 
   /* Label strip */
   ctx.fillStyle = TH.panelHi; ctx.fillRect(0, 0, w, 22);
@@ -430,13 +432,19 @@ function drawVcon() {
 
   ctx.fillStyle = TH.panelHi;
   ctx.fillRect(8, bandY, w - 16, bandH);
-  /* amber caution margins, green core */
-  ctx.fillStyle = TH.amber; ctx.globalAlpha = 0.35;
+  /* amber caution margins, green core.
+   * NOT alpha-composited: any alpha meaningfully below 1 mixes a warm
+   * saturated color toward the near-black panel background, and that
+   * mix passes through brown/olive territory regardless of how high
+   * alpha goes short of ~0.9+ — it's not a tunable amount, it's the
+   * wrong technique for this background. Real ASI tape color arcs
+   * (what this is modeled on) are solid opaque strips, not tinted
+   * fills — matching that here instead of chasing an alpha value. */
+  ctx.fillStyle = TH.amber;
   ctx.fillRect(X(lo), bandY, X(lo + warn) - X(lo), bandH);
   ctx.fillRect(X(hi - warn), bandY, X(hi) - X(hi - warn), bandH);
-  ctx.globalAlpha = 0.5; ctx.fillStyle = TH.green;
+  ctx.fillStyle = TH.green;
   ctx.fillRect(X(lo + warn), bandY, X(hi - warn) - X(lo + warn), bandH);
-  ctx.globalAlpha = 1;
   ctx.strokeStyle = TH.dim; ctx.lineWidth = 1;
   ctx.strokeRect(X(lo), bandY, X(hi) - X(lo), bandH);
 
@@ -715,7 +723,7 @@ function drawNav() {
   const cx = w / 2, cy = S / 2;              /* map square, top-aligned */
 
   /* Scale is set by the RANGE RINGS, not by a snapped fit-everything box.
-     The outer ring is always a whole multiple of 10 km and the inner ring
+     The outer ring is always a whole multiple of 10 NM and the inner ring
      is half of it; the rings are drawn at fixed 0.5 / 0.25 of the display
      radius below, so the full display radius (S/2) is exactly twice the
      outer ring.
@@ -723,22 +731,30 @@ function drawNav() {
      Why: the old powers-of-{1,2,5} scale list stepped down in 2x/2.5x
      jumps, and each step moved the destination diamond a long way across
      the display — the "target swinging around as you close in" problem.
-     With 10 km buckets the worst-case jump when the scale steps down at
-     n x 10 km is 0.5/(n+1) of the display radius: exactly the ring
-     spacing at the 10 km crossing (diamond hops from the inner ring out
+     With 10 NM buckets the worst-case jump when the scale steps down at
+     n x 10 NM is 0.5/(n+1) of the display radius: exactly the ring
+     spacing at the 10 NM crossing (diamond hops from the inner ring out
      to the outer one) and smaller at every step above it.
 
-     Floored at 10 km, so inside 10 km the rings stop changing (10 / 5)
+     Floored at 10 NM, so inside 10 NM the rings stop changing (10 / 5)
      and the diamond just walks smoothly in toward the aircraft symbol
      with no further jumps at all.
+
+     Units: geometry (dWp, radius, px()) all stay in metres throughout —
+     only the QUANTIZATION STEP is defined in NM (converted to metres via
+     NM_M below) so the ring labels land on round NM numbers instead of
+     round km numbers relabelled. Changing NM_M's multiplier changes the
+     step; changing the unit back to km/other requires touching this
+     constant only, not the derivation below it.
 
      Note this no longer widens the scale to keep the ORIGIN marker on
      screen; on a long route the origin walks off the display late in the
      flight (its marker is already drawn only when on-screen, and the
      track history is clipped).  That's the price of the destination
      holding still, and the destination is the one that's being flown to. */
+  const NM_M = 1852;
   const dWp = Math.hypot(nav.x - nav.wx, nav.y - nav.wy);
-  const RING_STEP_M = 10000;
+  const RING_STEP_M = 10 * NM_M;
   const ringOuterM = Math.max(RING_STEP_M, Math.ceil(dWp / RING_STEP_M) * RING_STEP_M);
   const radius = 2 * ringOuterM;             /* metres at the display radius */
 
@@ -773,14 +789,14 @@ function drawNav() {
 
   /* Range rings at 1/4 and 1/2 of the display radius.  These fractions
      are load-bearing: `radius` above is derived from them, so the outer
-     ring reads as a whole multiple of 10 km and the inner as half that.
+     ring reads as a whole multiple of 10 NM and the inner as half that.
      Changing a fraction here without changing that derivation breaks the
      round numbers. */
   ctx.strokeStyle = TH.dim; ctx.lineWidth = 1;
   for (const f of [0.25, 0.5]) {
     ctx.beginPath(); ctx.arc(cx, cy, f * (S / 2), 0, 2 * Math.PI); ctx.stroke();
     const rm = f * radius;
-    const lbl = rm >= 1000 ? `${fmt(rm / 1000)} km` : `${fmt(rm)} m`;
+    const lbl = `${fmt(rm * M2NM)} NM`;
     txt(ctx, lbl, cx + 4, cy - f * (S / 2) + 9, F(9, 700), TH.dim, "left");
   }
 
@@ -799,7 +815,7 @@ function drawNav() {
   /* bearing line to waypoint */
   const [wxp, wyp] = px(nav.wx, nav.wy);
   ctx.setLineDash([4, 4]);
-  ctx.strokeStyle = TH.blue; ctx.lineWidth = 0.9;
+  ctx.strokeStyle = TH.navAccent; ctx.lineWidth = 0.9;
   ctx.beginPath(); ctx.moveTo(cx, cy); ctx.lineTo(wxp, wyp); ctx.stroke();
   ctx.setLineDash([]);
 
@@ -811,8 +827,8 @@ function drawNav() {
     txt(ctx, init.icao || "ORIG", oxp + 8, oyp - 8, F(10), TH.text, "left");
   }
 
-  /* waypoint diamond — RTB green / TGT blue */
-  const wcol = nav.rtb ? TH.green : TH.blue;
+  /* waypoint diamond — RTB green / TGT nav-accent (blue NVG, magenta day) */
+  const wcol = nav.rtb ? TH.green : TH.navAccent;
   const d = 8;
   ctx.strokeStyle = wcol; ctx.lineWidth = 1.8;
   ctx.fillStyle = wcol; ctx.globalAlpha = 0.18;
@@ -847,7 +863,7 @@ function drawNav() {
      currently is, which is separate from — and doesn't fight with —
      the threshold point's real (meaningful) distance from the
      aircraft changing as you fly.
-     Dashed blue, distinct from the solid-colour waypoint symbology.
+     Dashed nav-accent, distinct from the solid-colour waypoint symbology.
      Skipped if the server didn't provide a value (e.g. standalone
      playback without the mission_planner module loaded). */
   if (typeof init.back_trans_m === "number" && init.back_trans_m > 0 &&
@@ -857,7 +873,7 @@ function drawNav() {
     const targetHalfPx = 34;   // desired half-length of the arc, in pixels
     const halfAngle = Math.min(Math.PI / 8, targetHalfPx / Math.max(threshPxR, 1));   // capped at the original 45° span
     const centerAngle = Math.atan2(wyp - cy, wxp - cx);   // aircraft -> waypoint, same direction the bearing line uses
-    ctx.strokeStyle = TH.blue; ctx.lineWidth = 1.4;
+    ctx.strokeStyle = TH.navAccent; ctx.lineWidth = 1.4;
     ctx.setLineDash([5, 4]);
     ctx.beginPath();
     ctx.arc(cx, cy, threshPxR, centerAngle - halfAngle, centerAngle + halfAngle);
@@ -898,8 +914,8 @@ function drawNav() {
   ctx.lineTo(wxp + ux * (d + 16), wyp + uy * (d + 16));
   ctx.stroke();
 
-  const rngLbl = dWp / 1000 >= 10 ? `${fmt(dWp / 1000, 1)} km` :
-                 dWp / 1000 >= 1  ? `${fmt(dWp / 1000, 2)} km` : `${fmt(dWp)} m`;
+  const rngNm = dWp * M2NM;
+  const rngLbl = rngNm >= 10 ? `${fmt(rngNm, 1)} NM` : `${fmt(rngNm, 2)} NM`;
 
   // ETE (time enroute), MM:SS.  Below VSD_TRACK_MIN_KMH groundspeed
   // there's no meaningful track (same guard used for the VSD), so show
@@ -942,11 +958,11 @@ function drawNav() {
      below) — it's a slowly-changing number that had no business riding
      on a marker that walks across the display.  Same size/weight as the
      fixed corner readouts (CV_F, defined just below) for one consistent
-     type scale across the pane.  Colour is fixed TH.blue rather than
-     wcol — wcol also drives the diamond/label (green for RTB), but this
-     text is meant to read as one of the readout family, not as
+     type scale across the pane.  Colour is fixed TH.navAccent rather
+     than wcol — wcol also drives the diamond/label (green for RTB), but
+     this text is meant to read as one of the readout family, not as
      RTB-status symbology, so it doesn't switch with it. */
-  txt(ctx, `${pad3(brgForLabel)}\u00B0  ${rngLbl}`, lx, ly, FM(24, 700), TH.blue, "center");
+  txt(ctx, `${pad3(brgForLabel)}\u00B0  ${rngLbl}`, lx, ly, FM(24, 700), TH.navAccent, "center");
 
   /* ── Fixed corner readouts ─────────────────────────────────────────
      Everything here is at a constant screen position, clear of the
@@ -974,7 +990,7 @@ function drawNav() {
   const tasKt = inCruise && typeof st.tas === "number" ? st.tas * KMH2KT : null;
   txt(ctx, "TAS", 8, 16, CL_F, TH.dim, "left");
   txt(ctx, `${(tasKt === null ? "---" : fmt(tasKt)).padStart(3)} KT`, 46, 16,
-      CV_F, tasKt === null ? TH.dim : TH.text, "left");
+      CV_F, tasKt === null ? TH.dim : TH.green, "left");
 
   /* lower-left: cross-track error — perpendicular deviation from the
      straight origin -> destination leg.  Pure client-side geometry off
@@ -989,11 +1005,28 @@ function drawNav() {
     const uN = legN / legLen, uE = legE / legLen;
     const xte = nav.y * uN - nav.x * uE;        // +ve = right of course
     const a = Math.abs(xte);
-    xteLbl = (a >= 1000 ? `${fmt(a / 1000, 2)} km` : `${fmt(a)} m`) +
-             (xte >= 0 ? " R" : " L");
+    xteLbl = `${fmt(a * M2NM, 2)} NM` + (xte >= 0 ? " R" : " L");
   }
   txt(ctx, "XTE", 8, S - 40, CL_F, TH.dim, "left");
-  txt(ctx, xteLbl, 8, S - 17, CV_F, xteLbl === "---" ? TH.dim : TH.text, "left");
+  txt(ctx, xteLbl, 8, S - 17, CV_F, xteLbl === "---" ? TH.dim : TH.green, "left");
+
+  /* lower-right: desired track — the planned bearing along the original
+     origin -> destination leg, as opposed to BRG (current bearing from
+     the aircraft to wherever the diamond sits right now). BRG and DTK
+     start out equal and diverge as XTE grows, which is what tells you
+     you're drifting off course before XTE itself gets large enough to
+     notice. Reuses legN/legE from the XTE calc above — same leg vector,
+     just its direction instead of the perpendicular offset from it.
+     Coloured as nav-accent, matching BRG/RNG/ETE — it's course/heading
+     information about the destination leg, not an aircraft-state value
+     like TAS/XTE. */
+  let dtkLbl = "---";
+  if (legLen > 100) {
+    const dtk = ((Math.atan2(legE, legN) * 180 / Math.PI) + 360) % 360;
+    dtkLbl = `${pad3(dtk)}\u00B0`;
+  }
+  txt(ctx, "DTK", w - 8, S - 40, CL_F, TH.dim, "right");
+  txt(ctx, dtkLbl, w - 8, S - 17, CV_F, dtkLbl === "---" ? TH.dim : TH.navAccent, "right");
 
   /* aircraft symbol — fixed pointing straight up.  In heading-up mode
      the symbol doesn't rotate with heading; the map rotates around it
@@ -1200,7 +1233,7 @@ function drawHeader() {
 function renderAll() {
   drawHeader();
   const tsp = tapeSpeed(st);
-  drawTape("cv-speed", tsp.kmh * KMH2KT, 40, 10, 5, tsp.label, "KT", false, trend6("spd") * KMH2KT);
+  drawTape("cv-speed", tsp.kmh * KMH2KT, 40, 10, 5, tsp.label, "KT", false, trend6("spd") * KMH2KT, TH.green);
   drawTape("cv-alt",   st ? st.alt   : 0, 500, 100, 50, "ALT", "FT",  true,  trend6("alt"));
   drawADI();
   drawHeading();
