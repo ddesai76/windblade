@@ -1,7 +1,7 @@
 # glass_cockpit.jl:   eVTOL Tiltrotor Sim Glass Cockpit — browser-rendered, MIL-STD-3009 NVG
 # AUTHOR:              DANIEL DESAI
 # UPDATED:             2026-07-26
-# VERSION:             0.3.3
+# VERSION:             0.3.4
 #
 # Browser-rendered real-time instrument panel served by a thin Julia
 # HTTP/WebSocket backend.  Panel is the v0.2 uniform instrument grid
@@ -103,6 +103,27 @@ const IDX = (
     agl_terrain_m=26,                      # height above terrain directly below
                                            # (radar-altimeter sense; NaN when the
                                            #  terrain model / CSV column is absent)
+    tas_kmh=27,                            # TRUE airspeed (km/h) — wind-relative.
+                                           # IDX.speed is INERTIAL: fly.jl sets it
+                                           # from raw vx, so it is groundspeed, not
+                                           # airspeed, despite the tape's historic
+                                           # "IAS" label.  NaN until fly.jl writes
+                                           # this slot (or a CSV column supplies
+                                           # it); the client shows dashes for TAS.
+    ias_kmh=28,                            # INDICATED airspeed (km/h) — what the
+                                           # PFD speed tape wants.  Density-
+                                           # corrected TAS: IAS = TAS * sqrt(rho/rho0).
+                                           # Written by fly.jl rather than derived
+                                           # here on purpose — rho is the sim's own
+                                           # atmosphere (METAR temp/pressure, not
+                                           # ISA), and re-deriving it in the display
+                                           # server from st.alt would silently give
+                                           # a different number than the aero model
+                                           # is actually flying.  NaN until written;
+                                           # the client then falls back to
+                                           # groundspeed AND relabels the tape "GS",
+                                           # so the instrument never lies about what
+                                           # it is showing.
 )
 
 mutable struct CockpitState
@@ -127,10 +148,13 @@ function CockpitState(; n_rotors::Int=6,
                         powerplants::Vector{String}=fill("electric", 6),
                         fuel_kg::Float64=0.0,
                         fuel_capacity_kg::Float64=0.0)
-    CockpitState(vcat(zeros(24), [1.0, NaN]), "hover",
-                 # 26 vals: +gx/gy/gz +fx_frac/fz_frac +vrs +agl_terrain_m
+    CockpitState(vcat(zeros(24), [1.0, NaN, NaN, NaN]), "hover",
+                 # 28 vals: +gx/gy/gz +fx_frac/fz_frac +vrs +agl_terrain_m
+                 #          +tas_kmh +ias_kmh
                  # (vrs defaults clean=1.0; agl_terrain NaN until telemetry
-                 #  or a CSV column provides it — client shows TERR UNAVAIL)
+                 #  or a CSV column provides it — client shows TERR UNAVAIL;
+                 #  tas_kmh / ias_kmh NaN likewise — client shows dashes for
+                 #  TAS and falls the speed tape back to a "GS" label)
                  Float64[], Float64[],
                  zeros(6), zeros(6),
                  vcat(labels, fill("", 6))[1:6],
@@ -413,6 +437,14 @@ function _state_json(s::CockpitState, nav_map)::String
     # falls back to CG AGL and raises the TERR UNAVAIL advisory.
     isfinite(v[IDX.agl_terrain_m]) &&
         (d["agl_terr_m"] = _r3(v[IDX.agl_terrain_m]))
+    # True airspeed: omitted until something writes IDX.tas_kmh (live fly.jl
+    # telemetry or a CSV column).  Omitted rather than substituted with
+    # IDX.speed — that value is groundspeed, and quietly labelling it TAS
+    # would be wrong in exactly the wind conditions TAS is read for.
+    isfinite(v[IDX.tas_kmh]) &&
+        (d["tas"] = _r3(v[IDX.tas_kmh]))
+    isfinite(v[IDX.ias_kmh]) &&
+        (d["ias"] = _r3(v[IDX.ias_kmh]))
     terr_ahead = _terrain_ahead(v[IDX.x_m], v[IDX.y_m], v[IDX.yaw])
     terr_ahead !== nothing && (d["terr_ahead"] = terr_ahead)
     nav = _nav_dict(nav_map)
@@ -481,6 +513,8 @@ function _init_json(s::CockpitState; rpm_nom, kw_max, has_map)
         "icao"        => apt.icao,
         "ra_min_ft"   => RA_MIN_FT,
         "dest_icao"   => _dest_icao(),
+        "back_trans_m" => isdefined(Main, :DESCENT_INITIATION_M) ?
+                           Float64(Main.DESCENT_INITIATION_M) : nothing,
         "has_nav"     => has_map))
 end
 
@@ -686,6 +720,12 @@ function playback_csv(path::String; fps=10.0, nav_map=nothing)
         state.vals[IDX.agl_terrain_m] = hasproperty(row, :alt_agl_terrain_m) &&
                                         !ismissing(row.alt_agl_terrain_m) ?
                                             Float64(row.alt_agl_terrain_m) : NaN
+        state.vals[IDX.tas_kmh]       = hasproperty(row, :tas_kmh) &&
+                                        !ismissing(row.tas_kmh) ?
+                                            Float64(row.tas_kmh) : NaN
+        state.vals[IDX.ias_kmh]       = hasproperty(row, :ias_kmh) &&
+                                        !ismissing(row.ias_kmh) ?
+                                            Float64(row.ias_kmh) : NaN
 
         state.gear_contact         = hasproperty(row, :gear_contact)  ? Bool(row.gear_contact)  : false
         state.strut_load_n         = hasproperty(row, :strut_load_n)  ? Float64(row.strut_load_n) : 0.0
