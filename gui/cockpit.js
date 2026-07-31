@@ -77,6 +77,10 @@ const pad3 = (x) => String(Math.round(x)).padStart(3, "0");
 
 /* ── State ──────────────────────────────────────────────────────── */
 let init = null;          // static config ("init" message)
+// Smoothed groundspeed for ETE, time-constant based (not per-frame, so
+// it's correct regardless of server FPS) — see the ETE comment in
+// drawNav for why raw instantaneous speed makes a bad ETE input.
+let eteSmoothGsMs = null, eteSmoothT = null;
 let st   = null;          // latest "state" message
 let lastMsg = 0;          // performance.now() of last state frame
 const trend = [];         // ring buffer {t, spd, alt} for 6-s trend vectors
@@ -93,6 +97,19 @@ function radAltFt(s) {
 }
 const hasTerr = (s) => typeof s.agl_terr_m === "number";
 
+/* Speed-tape source.  The tape is an AIRSPEED indicator, so it wants IAS
+ * — wind- and density-corrected, and only real if the backend computed
+ * it.  st.speed is NOT that: it's raw inertial vx from fly.jl, i.e.
+ * groundspeed, and this panel showed it under an "IAS" label through
+ * v0.3.31, misreading by the whole wind component.  When IAS isn't on
+ * the wire the tape falls back to groundspeed and RELABELS itself "GS"
+ * rather than mislabelling the number it's got. */
+function tapeSpeed(s) {
+  if (!s) return { kmh: 0, label: "IAS" };
+  if (typeof s.ias === "number") return { kmh: s.ias, label: "IAS" };
+  return { kmh: s.speed, label: "GS" };
+}
+
 /* ── WebSocket ──────────────────────────────────────────────────── */
 function connect() {
   const ws = new WebSocket(`ws://${location.host}/ws`);
@@ -106,7 +123,8 @@ function connect() {
     } else if (m.type === "state") {
       st = m;
       lastMsg = performance.now();
-      trend.push({ t: m.t, spd: m.speed, alt: m.alt });
+      // trend vector follows whatever the tape is actually showing
+      trend.push({ t: m.t, spd: tapeSpeed(m).kmh, alt: m.alt });
       while (trend.length > 400 || (trend.length > 2 && m.t - trend[0].t > 8)) trend.shift();
       renderAll();
     }
@@ -366,7 +384,7 @@ function drawVcon() {
   if (!st) return;
 
   const { lo, hi } = st.vcon;
-  const tilt = st.tilt, spd = st.speed, warn = 15;
+  const tilt = st.tilt, warn = 15;
   const inTrans = tilt > 10 && tilt < 80;
 
   if (!inTrans) {
@@ -376,6 +394,29 @@ function drawVcon() {
     txt(ctx, `${fmt(lo * KMH2KT)}\u2013${fmt(hi * KMH2KT)} KT`, w * 0.66, h / 2, FM(9), TH.faint);
     return;
   }
+
+  /* The corridor (lo/hi bounds) is a stall/transition-envelope limit —
+     an AIRSPEED constraint, not a groundspeed one.  Comparing it against
+     st.speed (groundspeed) meant status here was silently wrong by the
+     wind component on any day with real wind, and wrong in exactly the
+     regime — low-speed transition — where being wrong matters most.
+     TAS is what the corridor is actually bounding, and there's no valid
+     way to reconstruct it from GS here: that needs the wind vector AT
+     THE AIRCRAFT, which this client never has (only the departure
+     airport's surface wind is on the wire, and only there because that's
+     the one place this sim's wind model is actually valid).  So when TAS
+     isn't on the wire (older CSV playback with no tas_kmh column), the
+     corridor shows an honest "unavailable" state rather than quietly
+     substituting groundspeed and risking a confident, wrong status. */
+  if (typeof st.tas !== "number") {
+    ctx.strokeStyle = TH.stroke; ctx.lineWidth = 0.8;
+    ctx.strokeRect(w * 0.06, h * 0.2, w * 0.88, h * 0.6);
+    txt(ctx, "VCON", w * 0.28, h / 2, F(11, 700), TH.faint);
+    txt(ctx, "TAS UNAVAIL", w * 0.66, h / 2, FM(9), TH.faint);
+    if (isStale()) redX(c);
+    return;
+  }
+  const spd = st.tas;
 
   const below = spd < lo, above = spd > hi;
   const outside = below || above;
@@ -654,7 +695,7 @@ function drawTvec() {
   ctx.beginPath(); ctx.arc(ox, oy, 2.6, 0, 2 * Math.PI); ctx.fill();
 
   /* readouts */
-  const mode = st.tilt < 20 ? "HOVER" : st.tilt > 80 ? "CRUISE" : "TRANSITION";
+  const mode = st.tilt < 20 ? "HOVER" : st.tilt >= 69 ? "CRUISE" : "TRANSITION";
   txt(ctx, "THRUST VECTOR", w / 2, 10, F(9), TH.faint);
   txt(ctx, `TILT ${fmt(st.tilt, 1)}\u00B0  ${mode}`, w / 2, h - 15, FM(10), TH.text);
   if (isStale()) redX(c);
@@ -673,18 +714,51 @@ function drawNav() {
   const S = Math.min(w, h);
   const cx = w / 2, cy = S / 2;              /* map square, top-aligned */
 
-  /* auto-scale: aircraft + waypoint + origin with 15 % margin, snapped */
-  const dWp = Math.hypot(nav.x - nav.wx, nav.y - nav.wy);
-  const dOr = Math.hypot(nav.x, nav.y);
-  const raw = Math.max(dWp, dOr, 200) * 1.15;
-  const scales = [100, 200, 500, 1000, 2000, 5000, 10000, 20000, 50000, 100000, 200000];
-  let radius = scales[scales.length - 1];
-  for (const s of scales) if (s >= raw) { radius = s; break; }
+  /* Scale is set by the RANGE RINGS, not by a snapped fit-everything box.
+     The outer ring is always a whole multiple of 10 km and the inner ring
+     is half of it; the rings are drawn at fixed 0.5 / 0.25 of the display
+     radius below, so the full display radius (S/2) is exactly twice the
+     outer ring.
 
-  const px = (wx, wy) => [cx + (wy - nav.y) / radius * (S / 2),
-                          cy - (wx - nav.x) / radius * (S / 2)];
+     Why: the old powers-of-{1,2,5} scale list stepped down in 2x/2.5x
+     jumps, and each step moved the destination diamond a long way across
+     the display — the "target swinging around as you close in" problem.
+     With 10 km buckets the worst-case jump when the scale steps down at
+     n x 10 km is 0.5/(n+1) of the display radius: exactly the ring
+     spacing at the 10 km crossing (diamond hops from the inner ring out
+     to the outer one) and smaller at every step above it.
+
+     Floored at 10 km, so inside 10 km the rings stop changing (10 / 5)
+     and the diamond just walks smoothly in toward the aircraft symbol
+     with no further jumps at all.
+
+     Note this no longer widens the scale to keep the ORIGIN marker on
+     screen; on a long route the origin walks off the display late in the
+     flight (its marker is already drawn only when on-screen, and the
+     track history is clipped).  That's the price of the destination
+     holding still, and the destination is the one that's being flown to. */
+  const dWp = Math.hypot(nav.x - nav.wx, nav.y - nav.wy);
+  const RING_STEP_M = 10000;
+  const ringOuterM = Math.max(RING_STEP_M, Math.ceil(dWp / RING_STEP_M) * RING_STEP_M);
+  const radius = 2 * ringOuterM;             /* metres at the display radius */
+
+  // Heading-up, not north-up: current aircraft heading points to the
+  // top of the display, not true north (and not bearing-to-destination
+  // — those are different things). World convention is x=North,
+  // y=East; rotate each point's (north,east) offset from the aircraft
+  // into a (forward,right) frame relative to current heading before
+  // mapping to screen, so "forward" always lands at the top.
+  const hdgRad = nav.hdg * Math.PI / 180;
+  const cosH = Math.cos(hdgRad), sinH = Math.sin(hdgRad);
+  const px = (wx, wy) => {
+    const dN = wx - nav.x, dE = wy - nav.y;
+    const fwd = dN * cosH + dE * sinH;
+    const right = -dN * sinH + dE * cosH;
+    return [cx + right / radius * (S / 2), cy - fwd / radius * (S / 2)];
+  };
 
   ctx.save();
+  try {
   ctx.beginPath(); ctx.rect(0, 0, w, S); ctx.clip();
 
   /* grid: 4 cells each way from the aircraft */
@@ -697,40 +771,44 @@ function drawNav() {
   }
   ctx.globalAlpha = 1;
 
-  /* range rings at 1/4 and 1/2 radius */
-  ctx.strokeStyle = TH.strokeHi; ctx.globalAlpha = 0.6; ctx.lineWidth = 0.7;
+  /* Range rings at 1/4 and 1/2 of the display radius.  These fractions
+     are load-bearing: `radius` above is derived from them, so the outer
+     ring reads as a whole multiple of 10 km and the inner as half that.
+     Changing a fraction here without changing that derivation breaks the
+     round numbers. */
+  ctx.strokeStyle = TH.dim; ctx.lineWidth = 1;
   for (const f of [0.25, 0.5]) {
     ctx.beginPath(); ctx.arc(cx, cy, f * (S / 2), 0, 2 * Math.PI); ctx.stroke();
     const rm = f * radius;
     const lbl = rm >= 1000 ? `${fmt(rm / 1000)} km` : `${fmt(rm)} m`;
-    txt(ctx, lbl, cx + 4, cy - f * (S / 2) + 8, F(8), TH.faint, "left");
+    txt(ctx, lbl, cx + 4, cy - f * (S / 2) + 9, F(9, 700), TH.dim, "left");
   }
-  ctx.globalAlpha = 1;
 
   /* track history */
   if (nav.pts && nav.pts.length > 1) {
-    ctx.strokeStyle = "rgba(46,128,153,0.7)"; ctx.lineWidth = 1.2;
+    ctx.strokeStyle = TH.text; ctx.globalAlpha = 0.55; ctx.lineWidth = 1.2;
     ctx.beginPath();
     nav.pts.forEach((p, i) => {
       const [x, y] = px(p[0], p[1]);
       i ? ctx.lineTo(x, y) : ctx.moveTo(x, y);
     });
     ctx.stroke();
+    ctx.globalAlpha = 1;
   }
 
   /* bearing line to waypoint */
   const [wxp, wyp] = px(nav.wx, nav.wy);
   ctx.setLineDash([4, 4]);
-  ctx.strokeStyle = TH.faint; ctx.lineWidth = 0.8;
+  ctx.strokeStyle = TH.blue; ctx.lineWidth = 0.9;
   ctx.beginPath(); ctx.moveTo(cx, cy); ctx.lineTo(wxp, wyp); ctx.stroke();
   ctx.setLineDash([]);
 
   /* origin marker + ICAO */
   const [oxp, oyp] = px(0, 0);
   if (oxp > -20 && oxp < w + 20 && oyp > -20 && oyp < S + 20) {
-    ctx.fillStyle = TH.panel; ctx.strokeStyle = TH.green; ctx.lineWidth = 1.5;
+    ctx.fillStyle = TH.panel; ctx.strokeStyle = TH.text; ctx.lineWidth = 1.5;
     ctx.beginPath(); ctx.arc(oxp, oyp, 5, 0, 2 * Math.PI); ctx.fill(); ctx.stroke();
-    txt(ctx, init.icao || "ORIG", oxp + 8, oyp - 8, F(10), TH.green, "left");
+    txt(ctx, init.icao || "ORIG", oxp + 8, oyp - 8, F(10), TH.text, "left");
   }
 
   /* waypoint diamond — RTB green / TGT blue */
@@ -745,47 +823,198 @@ function drawNav() {
   const wlabel = nav.rtb ? "RTB" : ((init.dest_icao && init.dest_icao.length) ? init.dest_icao : "TGT");
   txt(ctx, wlabel, wxp + 10, wyp - 10, F(10), wcol, "left");
 
-  /* aircraft symbol — filled triangle rotated to heading */
-  const hr = nav.hdg * Math.PI / 180;
-  const rot = (x, y) => [cx + x * Math.cos(hr) + y * Math.sin(hr),
-                         cy + x * Math.sin(hr) - y * Math.cos(hr)];
+  /* Back-transition distance arc — marks where the autopilot begins
+     back-transition/descent (DESCENT_INITIATION_M) on approach: the
+     point that many meters short of the destination, along the
+     current bearing to it.  Previous version lost track of this and
+     always sat exactly at the waypoint regardless of back_trans_m's
+     value — fixed here: positioned at distance (dWp - back_trans_m)
+     from the AIRCRAFT along the bearing line, so it visibly closes in
+     toward the aircraft's own position as the flight progresses, and
+     is skipped entirely once dWp <= back_trans_m — i.e. once the
+     aircraft has actually reached/passed the threshold, there's
+     nothing ahead left to mark.
+     Still a genuine segment of a circle CENTERED ON THE AIRCRAFT
+     (cx, cy) — same centre as the range rings — for the same curvature
+     reason as before: a small circle centred at a point curves TOWARD
+     whatever's nearby at its near vertex, opposite the sense a range
+     ring has at that location, since those are centred on the
+     aircraft and curve AWAY from it.
+     Fixed pixel (not angular) arc length, like the range rings' fixed
+     pixel radius — shrinking the angular half-width as the radius
+     grows (arc length ≈ radius × angle) keeps the arc's own on-screen
+     size roughly constant regardless of how far the threshold point
+     currently is, which is separate from — and doesn't fight with —
+     the threshold point's real (meaningful) distance from the
+     aircraft changing as you fly.
+     Dashed blue, distinct from the solid-colour waypoint symbology.
+     Skipped if the server didn't provide a value (e.g. standalone
+     playback without the mission_planner module loaded). */
+  if (typeof init.back_trans_m === "number" && init.back_trans_m > 0 &&
+      dWp > init.back_trans_m) {
+    const acDist = Math.hypot(wxp - cx, wyp - cy) || 1;   // pixels, aircraft -> waypoint
+    const threshPxR = acDist * ((dWp - init.back_trans_m) / dWp);   // pixels, aircraft -> threshold point
+    const targetHalfPx = 34;   // desired half-length of the arc, in pixels
+    const halfAngle = Math.min(Math.PI / 8, targetHalfPx / Math.max(threshPxR, 1));   // capped at the original 45° span
+    const centerAngle = Math.atan2(wyp - cy, wxp - cx);   // aircraft -> waypoint, same direction the bearing line uses
+    ctx.strokeStyle = TH.blue; ctx.lineWidth = 1.4;
+    ctx.setLineDash([5, 4]);
+    ctx.beginPath();
+    ctx.arc(cx, cy, threshPxR, centerAngle - halfAngle, centerAngle + halfAngle);
+    ctx.stroke();
+    ctx.setLineDash([]);
+  }
+
+  /* ── BRG/RNG/ETE readout, anchored to the actual waypoint position ──
+     Positioned as an offset from the waypoint's own on-screen location
+     (wxp, wyp) along the bearing direction, not an independent radius
+     from the display centre.  The earlier version placed the label at
+     a fixed fraction of the display radius; whenever the waypoint's
+     actual (auto-scaled) position happened to land near that same
+     radius, the label collided with the waypoint's own diamond/ICAO
+     label.  Anchoring to the real waypoint position instead means the
+     label is defined relative to the thing it can't afford to overlap,
+     so it can't happen regardless of zoom or distance.  Single
+     horizontal line (not three stacked) — three lines of large bold
+     text sitting right on top of the diamond/ICAO label read as
+     cluttered even without overlapping it. Text stays upright — only
+     its position is polar. */
+  const brgForLabel = ((Math.atan2(nav.wy - nav.y, nav.wx - nav.x) * 180 / Math.PI) + 360) % 360;
+  // On-screen direction from aircraft to waypoint, taken from the
+  // actual rendered positions (cx,cy)->(wxp,wyp) rather than
+  // recomputed from world bearing — stays correct regardless of map
+  // rotation (heading-up here), since it's derived from what's already
+  // on screen instead of assuming a north-up projection.
+  const ddx = wxp - cx, ddy = wyp - cy;
+  const ddist = Math.hypot(ddx, ddy) || 1;
+  const ux = ddx / ddist, uy = ddy / ddist;
+  const offR = d + 110;   // pushed further out — was sitting low, near the diamond
+  const lx = wxp + ux * offR;
+  const ly = Math.max(14, wyp + uy * offR);   // never off the top of a short pane
+
+  ctx.strokeStyle = wcol; ctx.lineWidth = 2;
+  ctx.beginPath();
+  ctx.moveTo(wxp + ux * (d + 2), wyp + uy * (d + 2));
+  ctx.lineTo(wxp + ux * (d + 16), wyp + uy * (d + 16));
+  ctx.stroke();
+
+  const rngLbl = dWp / 1000 >= 10 ? `${fmt(dWp / 1000, 1)} km` :
+                 dWp / 1000 >= 1  ? `${fmt(dWp / 1000, 2)} km` : `${fmt(dWp)} m`;
+
+  // ETE (time enroute), MM:SS.  Below VSD_TRACK_MIN_KMH groundspeed
+  // there's no meaningful track (same guard used for the VSD), so show
+  // a blank rather than a huge or noisy estimate.
+  //
+  // The speed used is smoothed with a ~6s time constant, not
+  // instantaneous — raw distance/instantaneous-speed swings wildly
+  // during hover->transition->cruise: right as speed first crosses the
+  // 15 km/h floor it's still barely above zero, so dist/speed briefly
+  // computes something absurd (110 km at 15 km/h ≈ 7 hours), and as
+  // speed then ramps up through transition the recomputed-from-scratch
+  // value collapses far faster than real time is actually passing.
+  // Smoothing means ETE only settles once speed has actually settled,
+  // which is what a stable "time enroute" reading should do.
+  //
+  // Only computed/shown once hover and transition are behind us — same
+  // tilt >= 69° threshold as the thrust-vector pane's HOVER/TRANSITION/
+  // CRUISE convention, which is also where fly.jl's own phase machine
+  // flips from "transition" to "fw_climb"/"dash" (τ >= T_TRANS_END, by
+  // which point the tilt schedule has already carried tilt to ~70°).
+  // This same flag also gates the GS/TAS corner readout below — one
+  // flag, so ETE and GS/TAS can't disagree about whether transition is
+  // over.
+  const inCruise = st.tilt >= 69;
+  const instGsMs = st.speed / 3.6;
+  if (inCruise) {
+    const dt = eteSmoothT !== null ? Math.max(0, st.t - eteSmoothT) : 0;
+    const tau = 6;   // seconds
+    const alpha = eteSmoothGsMs === null ? 1 : 1 - Math.exp(-dt / tau);
+    eteSmoothGsMs = eteSmoothGsMs === null ? instGsMs : eteSmoothGsMs + alpha * (instGsMs - eteSmoothGsMs);
+  } else {
+    eteSmoothGsMs = null;   // reset outside cruise so the next cruise segment starts fresh, not stale
+  }
+  eteSmoothT = st.t;
+  const eteS = (inCruise && eteSmoothGsMs !== null) ? dWp / eteSmoothGsMs : null;
+  const eteLbl = eteS === null ? null :
+    `${String(Math.floor(eteS / 60)).padStart(2, "0")}:${String(Math.floor(eteS % 60)).padStart(2, "0")}`;
+
+  /* Waypoint-anchored readout: BRG and RNG only.  ETE moved off it (see
+     below) — it's a slowly-changing number that had no business riding
+     on a marker that walks across the display.  Same size/weight as the
+     fixed corner readouts (CV_F, defined just below) for one consistent
+     type scale across the pane.  Colour is fixed TH.blue rather than
+     wcol — wcol also drives the diamond/label (green for RTB), but this
+     text is meant to read as one of the readout family, not as
+     RTB-status symbology, so it doesn't switch with it. */
+  txt(ctx, `${pad3(brgForLabel)}\u00B0  ${rngLbl}`, lx, ly, FM(24, 700), TH.blue, "center");
+
+  /* ── Fixed corner readouts ─────────────────────────────────────────
+     Everything here is at a constant screen position, clear of the
+     moving symbology.  Shared idiom: small dim label, large mono value
+     beneath (or beside, for the GS/TAS pair, which reads better as a
+     two-row table than as four stacked lines).  Fields never vanish —
+     unavailable values go to dim dashes, because at a fixed position a
+     blank field reads as a broken instrument. */
+  const CV_F = FM(24, 700), CL_F = F(13, 700);
+
+  /* upper-right: destination ident + ETE */
+  const cnrX = w - 8;
+  txt(ctx, wlabel, cnrX, 14, F(15, 700), wcol, "right");
+  txt(ctx, eteLbl || "--:--", cnrX, 37, CV_F, eteLbl ? wcol : TH.dim, "right");
+
+  /* upper-left: true airspeed, in knots to match the speed tape and the
+     VCON readout.
+     Withheld during hover/transition — reuses `inCruise` (tilt >= 69,
+     same fw_climb-or-later threshold ETE already gates on above) rather
+     than a second tilt check, so the two fields can't disagree about
+     when the aircraft has actually left transition.  Dim dashes, not an
+     omitted field, for the same reason ETE stays put and dashes rather
+     than vanishing: a fixed-position blank reads as a broken
+     instrument. */
+  const tasKt = inCruise && typeof st.tas === "number" ? st.tas * KMH2KT : null;
+  txt(ctx, "TAS", 8, 16, CL_F, TH.dim, "left");
+  txt(ctx, `${(tasKt === null ? "---" : fmt(tasKt)).padStart(3)} KT`, 46, 16,
+      CV_F, tasKt === null ? TH.dim : TH.text, "left");
+
+  /* lower-left: cross-track error — perpendicular deviation from the
+     straight origin -> destination leg.  Pure client-side geometry off
+     values already on the wire; no telemetry needed.  World frame is
+     x=North, y=East, so "right of course" is (-uE, uN) and the signed
+     deviation is p·r.  Dashes on a degenerate leg (RTB, where the
+     waypoint IS the origin, so there's no course line to deviate from). */
+  const legN = nav.wx, legE = nav.wy;
+  const legLen = Math.hypot(legN, legE);
+  let xteLbl = "---";
+  if (legLen > 100) {
+    const uN = legN / legLen, uE = legE / legLen;
+    const xte = nav.y * uN - nav.x * uE;        // +ve = right of course
+    const a = Math.abs(xte);
+    xteLbl = (a >= 1000 ? `${fmt(a / 1000, 2)} km` : `${fmt(a)} m`) +
+             (xte >= 0 ? " R" : " L");
+  }
+  txt(ctx, "XTE", 8, S - 40, CL_F, TH.dim, "left");
+  txt(ctx, xteLbl, 8, S - 17, CV_F, xteLbl === "---" ? TH.dim : TH.text, "left");
+
+  /* aircraft symbol — fixed pointing straight up.  In heading-up mode
+     the symbol doesn't rotate with heading; the map rotates around it
+     instead, so "up" is always where the aircraft is pointed. */
   const sz = S * 0.028;
   ctx.fillStyle = TH.text;
   ctx.beginPath();
-  const p0 = rot(0, sz), p1 = rot(-sz * 0.55, -sz * 0.6),
-        p2 = rot(0, -sz * 0.2), p3 = rot(sz * 0.55, -sz * 0.6);
-  ctx.moveTo(p0[0], p0[1]); ctx.lineTo(p1[0], p1[1]);
-  ctx.lineTo(p2[0], p2[1]); ctx.lineTo(p3[0], p3[1]);
+  ctx.moveTo(cx, cy - sz); ctx.lineTo(cx - sz * 0.55, cy + sz * 0.6);
+  ctx.lineTo(cx, cy + sz * 0.2); ctx.lineTo(cx + sz * 0.55, cy + sz * 0.6);
   ctx.closePath(); ctx.fill();
-  ctx.restore();
-
-  /* ── data readout strip ─────────────────────────────────────────── */
-  const brg = ((Math.atan2(nav.wy - nav.y, nav.wx - nav.x) * 180 / Math.PI) + 360) % 360;
-  const rngKm = dWp / 1000;
-  const rngStr = rngKm >= 10 ? `${fmt(rngKm, 1)} km` :
-                 rngKm >= 1  ? `${fmt(rngKm, 2)} km` : `${fmt(dWp)} m`;
-  const aglM = nav.agl, aglFt = aglM * 3.28084;
-  const dash = nav.phase === "dash";
-  const aglCol = dash
-    ? (aglM < 100 ? TH.red : aglM < 300 ? TH.amber : TH.green)
-    : (aglM < 30  ? TH.red : aglM < 100 ? TH.amber : TH.green);
-
-  const ry = S + 8, rh = h - S - 12;
-  if (rh > 40) {
-    txt(ctx, "BRG", 12, ry + 8, F(10), TH.dim, "left");
-    txt(ctx, pad3(brg) + "\u00B0", 12, ry + 30, FM(21, 700), wcol, "left");
-    txt(ctx, "RNG", 12, ry + rh - 26, F(10), TH.dim, "left");
-    txt(ctx, rngStr, 12, ry + rh - 4, FM(21, 700), wcol, "left");
-
-    ctx.fillStyle = aglCol; ctx.globalAlpha = 0.1;
-    ctx.fillRect(w * 0.5, ry + 4, w * 0.5 - 8, rh - 4);
-    ctx.globalAlpha = 0.45;
-    ctx.strokeStyle = aglCol; ctx.lineWidth = 1;
-    ctx.strokeRect(w * 0.5, ry + 4, w * 0.5 - 8, rh - 4);
-    ctx.globalAlpha = 1;
-    txt(ctx, "AGL", w - 20, ry + 14, F(10), TH.dim, "right");
-    txt(ctx, `${fmt(aglFt)} ft`, w - 20, ry + rh - 14, FM(32, 700), aglCol, "right");
+  } catch (e) {
+    // A bug anywhere in the map (compass rose, track, symbols — several
+    // trig-heavy features layered on over recent iterations) must never
+    // be able to silently kill the BRG/RNG/ETA readout strip below.
+    // ctx.restore() still runs via `finally`, so canvas state doesn't
+    // leak even if this fires.
+    console.error("drawNav map render error:", e);
+  } finally {
+    ctx.restore();
   }
+
   if (isStale()) redX(c);
 }
 
@@ -970,7 +1199,8 @@ function drawHeader() {
 /* ── Render ─────────────────────────────────────────────────────── */
 function renderAll() {
   drawHeader();
-  drawTape("cv-speed", st ? st.speed * KMH2KT : 0, 40, 10, 5, "IAS", "KT", false, trend6("spd") * KMH2KT);
+  const tsp = tapeSpeed(st);
+  drawTape("cv-speed", tsp.kmh * KMH2KT, 40, 10, 5, tsp.label, "KT", false, trend6("spd") * KMH2KT);
   drawTape("cv-alt",   st ? st.alt   : 0, 500, 100, 50, "ALT", "FT",  true,  trend6("alt"));
   drawADI();
   drawHeading();
