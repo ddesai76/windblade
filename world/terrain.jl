@@ -1,7 +1,7 @@
 # terrain.jl:      Ground-track elevation profile model
 # AUTHOR:          DANIEL DESAI
-# UPDATED:         2026-05-10
-# VERSION:         0.1.0
+# UPDATED:         2026-07-28
+# VERSION:         0.2.0
 #
 #
 # Piecewise-linear terrain profile along the mission ground track.
