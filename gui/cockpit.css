@@ -32,6 +32,9 @@
   --amber:      #e8c000;  /* NVIS Yellow  (u'=.260 v'=.520) — caution */
   --red:        #ff2800;  /* NVIS Red     (u'=.400 v'=.460) — warning */
   --blue:       #47a6f2;  /* NVIS Blue vendor ext. — secondary info */
+  --nav-accent: #47a6f2;  /* destination symbology (BRG/RNG/ETE, bearing
+                              line, waypoint diamond, back-transition arc)
+                              — same as --blue in NVG, magenta in day */
   --sky:        #0a1a14;  /* ADI sky — low-luminance NVIS-safe tint */
   --ground:     #1a1405;  /* ADI ground — dark olive */
   --bug-fill:   rgba(0, 56, 13, 0.95);   /* value-bug box fill (RGBAf 0,.22,.05) */
@@ -50,6 +53,7 @@
   --amber:      #ffb300;  /* caution */
   --red:        #ff2a1a;  /* warning */
   --blue:       #35b7f0;  /* informational */
+  --nav-accent: #e830c8;  /* destination symbology — magenta in day mode */
   --sky:        #1b66c9;  /* EFIS attitude blue */
   --ground:     #6b4a24;  /* EFIS attitude brown */
   --bug-fill:   rgba(6, 10, 14, 0.95);
