@@ -189,8 +189,6 @@ const WEIGHT_N  = AIRFRAME.mass_kg * 9.81
 # Referencing IAS to that would make the ASI read equal to TAS at sea
 # level on a hot day, when a real one reads low.
 const RHO_SL_ISA = 1.225
-@show ATM.airport_alt_m ATM.ambient_temp_c ATM.ambient_pressure  # ← temporary
-@show rho(0.0)  
 preflight_da_warning(WEIGHT_N)             # @warn if T/W < 1.05 at departure DA
 
 # ── Inertia tensor (body frame, kg·m²) ────────────────────────────────
