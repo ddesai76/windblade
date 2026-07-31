@@ -2284,9 +2284,18 @@ function v(id){return document.getElementById(id).value.trim();}
 var wxTimer={dep:null,arr:null};
 var manualOpen=false;
 var airportData={};
+var terrainPairs=[];
 
 function loadAirports(){
   fetch('/airports').then(r=>r.json()).then(function(d){airportData=d;updateRouteInfo();}).catch(function(){});
+}
+
+function loadTerrainPairs(){
+  fetch('/terrain_pairs').then(r=>r.json()).then(function(d){terrainPairs=d;updateRouteInfo();}).catch(function(){});
+}
+
+function hasPredefinedTerrain(dep,arr){
+  return terrainPairs.indexOf(dep+'-'+arr)>=0 || terrainPairs.indexOf(arr+'-'+dep)>=0;
 }
 
 function haversineKm(lat1,lon1,lat2,lon2){
@@ -2305,7 +2314,13 @@ function updateRouteInfo(){
   var depLbl=dep?(da?(da.name||dep):dep+' — not in airports.csv'):'?';
   var arrLbl=arr?(aa?(aa.name||arr):arr+' — not in airports.csv'):'?';
   var dist=(da&&aa)?' — '+haversineKm(da.lat,da.lon,aa.lat,aa.lon).toFixed(1)+' km':'';
-  el.textContent=depLbl+'  →  '+arrLbl+dist;
+  var terrain='';
+  if(dep&&arr&&/^[A-Z0-9]{4}$/.test(dep)&&/^[A-Z0-9]{4}$/.test(arr)){
+    terrain=hasPredefinedTerrain(dep,arr)
+      ? '  <span class="c-ok">&#10003; predefined terrain</span>'
+      : '  <span class="c-warn">&#9888; no predefined terrain — SRTM download or flat-world model</span>';
+  }
+  el.innerHTML=depLbl+'  →  '+arrLbl+dist+terrain;
 }
 
 function icaoChanged(which){
@@ -2774,6 +2789,7 @@ function loadResults(f){
 
 loadRotors();
 loadAirports();
+loadTerrainPairs();
 fetchWx('dep');
 fetchWx('arr');
 sync();
@@ -2933,6 +2949,9 @@ class _Handler(BaseHTTPRequestHandler):
                 icao: {"name": a.name, "lat": a.lat, "lon": a.lon, "elev_m": a.elev_m}
                 for icao, a in airports.items()
             })
+
+        elif path == "/terrain_pairs":
+            self._send_json(200, sorted(predefined_pairs()))
 
         elif path == "/metar":
             from urllib.parse import parse_qs
