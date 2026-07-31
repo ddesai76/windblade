@@ -183,6 +183,12 @@ end
 # ── Derived constants ─────────────────────────────────────────────────
 const TARGET_MS = TC.dash_speed_kmh / 3.6
 const WEIGHT_N  = AIRFRAME.mass_kg * 9.81
+# ISA sea-level standard density — the reference IAS is defined against.
+# Deliberately NOT rho(0.0): rho() carries the day's actual METAR
+# temperature/pressure, so rho(0.0) is *today's* sea-level density.
+# Referencing IAS to that would make the ASI read equal to TAS at sea
+# level on a hot day, when a real one reads low.
+const RHO_SL_ISA = 1.225
 @show ATM.airport_alt_m ATM.ambient_temp_c ATM.ambient_pressure  # ← temporary
 @show rho(0.0)  
 preflight_da_warning(WEIGHT_N)             # @warn if T/W < 1.05 at departure DA
@@ -784,14 +790,15 @@ function start_csv_writer(path::String)
         "kw_r1,kw_r2,kw_r3,kw_r4,kw_r5,kw_r6," *
         "q0,q1,q2,q3," *
         "powerplant_r1,powerplant_r2,powerplant_r3,powerplant_r4,powerplant_r5,powerplant_r6," *
-        "fuel_kg,fuel_capacity_kg")
+        "fuel_kg,fuel_capacity_kg," *
+        "tas_kmh,ias_kmh")
     _csv_io[] = f
 end
 
 function write_csv_row(row)
     f = _csv_io[]
     f === nothing && return
-    @printf(f, "%.2f,%.2f,%s,%.2f,%.1f,%.1f,%.3f,%.1f,%.2f,%.1f,%.1f,%.1f,%.1f,%.2f,%.1f,%.4f,%.4f,%.4f,%.3f,%.3f,%.3f,%.4f,%.4f,%.4f,%d,%.1f,%.0f,%.0f,%.0f,%.0f,%.0f,%.0f,%.1f,%.1f,%.1f,%.1f,%.1f,%.1f,%.6f,%.6f,%.6f,%.6f,%s,%s,%s,%s,%s,%s,%.3f,%.3f\n",
+    @printf(f, "%.2f,%.2f,%s,%.2f,%.1f,%.1f,%.3f,%.1f,%.2f,%.1f,%.1f,%.1f,%.1f,%.2f,%.1f,%.4f,%.4f,%.4f,%.3f,%.3f,%.3f,%.4f,%.4f,%.4f,%d,%.1f,%.0f,%.0f,%.0f,%.0f,%.0f,%.0f,%.1f,%.1f,%.1f,%.1f,%.1f,%.1f,%.6f,%.6f,%.6f,%.6f,%s,%s,%s,%s,%s,%s,%.3f,%.3f,%.2f,%.2f\n",
         row.t, row.tau, row.phase, row.speed, row.alt_msl_ft, row.power, row.vrs_factor,
         row.tilt,
         row.soc, row.voltage, row.batt_temp,
@@ -807,7 +814,8 @@ function write_csv_row(row)
         row.q0, row.q1, row.q2, row.q3,
         row.powerplant[1], row.powerplant[2], row.powerplant[3],
         row.powerplant[4], row.powerplant[5], row.powerplant[6],
-        row.fuel_kg, row.fuel_capacity_kg)
+        row.fuel_kg, row.fuel_capacity_kg,
+        row.tas_kmh, row.ias_kmh)
     flush(f)
 end
 
@@ -918,7 +926,26 @@ function make_saving_cb(rt_factor::Float64, dt_ref::Ref{Float64})
                 end
             end
 
-            speed_kmh  = vx * 3.6
+            speed_kmh  = vx * 3.6            # INERTIAL — this is groundspeed
+            # ── Airspeeds (TAS / IAS) ─────────────────────────────────
+            # speed_kmh above is raw vx: groundspeed, not airspeed.  The
+            # wind-relative speed is reconstructed here with the SAME
+            # expression the ODE uses (vx_air = vx - wu, less the
+            # longitudinal Dryden gust state when turbulence is on) —
+            # both terms are available from the saved state, so this is
+            # the number the aero model actually flew, not a second
+            # independent estimate of it.  Body-x component, matching
+            # how speed_kmh itself is defined; not the 3-D airspeed
+            # magnitude, so it under-reads in a steep climb or descent.
+            _wu_cb, _, _ = atm_wind(ATM, alt)
+            _vx_air_cb   = Float64(vx) - Float64(_wu_cb)
+            ATM.wind.turbulence_intensity > 0.0 &&
+                (_vx_air_cb -= Float64(u[end-2]))
+            tas_kmh = _vx_air_cb * 3.6
+            # IAS = TAS * sqrt(rho/rho0).  rho(alt) is the same density
+            # call the aero model and vrs_factor use, so the indicated
+            # speed is consistent with the air the aircraft is flying in.
+            ias_kmh = tas_kmh * sqrt(rho(Float64(alt)) / RHO_SL_ISA)
             alt_msl_ft = agl_m_to_msl_ft(alt)
             _raw_phase = if MANUAL
                 HOTAS.tilt_frac[] >= 0.5 ? "manual-cruise" : "manual-hover"
@@ -1069,7 +1096,8 @@ function make_saving_cb(rt_factor::Float64, dt_ref::Ref{Float64})
                 gear_contact=gear_on, strut_load_n=strut_n,
                 rpm=rpm_each .* (60.0 / 2π), kw=kw_each,
                 powerplant=_ROTOR_POWERPLANT_LABELS,
-                fuel_kg=fuel_kg, fuel_capacity_kg=fuel_capacity_kg))
+                fuel_kg=fuel_kg, fuel_capacity_kg=fuel_capacity_kg,
+                tas_kmh=tas_kmh, ias_kmh=ias_kmh))
 
             if SHOW_GUI
                 s = _cockpit_state
@@ -1111,6 +1139,11 @@ function make_saving_cb(rt_factor::Float64, dt_ref::Ref{Float64})
                 # already written to the CSV row above.
                 s.vals[IDX.vrs]           = _vrs_cb
                 s.vals[IDX.agl_terrain_m] = _aglterr
+                # Airspeeds: TAS for the NAV pane's GS/TAS block, IAS for
+                # the PFD speed tape (which showed IDX.speed — groundspeed
+                # — under an "IAS" label until this was added).
+                s.vals[IDX.tas_kmh]       = tas_kmh
+                s.vals[IDX.ias_kmh]       = ias_kmh
                 s.phase              = phase
                 s.fuel_kg            = fuel_kg
                 for i in 1:6
